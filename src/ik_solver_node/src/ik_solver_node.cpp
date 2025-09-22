@@ -11,9 +11,8 @@
 #include <kdl/chainiksolverpos_nr.hpp>
 #include <kdl/chainfksolverpos_recursive.hpp>
 
-#include "xr_interfaces/srv/get_pose.hpp"
-#include "xr_interfaces/srv/get_key_value.hpp"
-#include "xr_interfaces/srv/get_button_state.hpp"
+#include "xr_interfaces/msg/key_value.hpp"
+#include "xr_interfaces/msg/pose.hpp"
 
 #include <Eigen/Dense>
 #include <memory>
@@ -33,16 +32,11 @@ public:
         this->declare_parameter("control_frequency", 50.0);
         this->declare_parameter("base_link", "base_link");
         this->declare_parameter("end_effector_link", "bracelet_link");
-        this->declare_parameter("control_trigger", "right_grip");
-        this->declare_parameter("gripper_trigger", "right_trigger");
-        this->declare_parameter("pose_source", "right_controller");
         
         // IK parameters
         this->declare_parameter("ik_position_tolerance", 0.001);  // 1mm
         this->declare_parameter("ik_orientation_tolerance", 0.01); // ~0.57 degrees
         this->declare_parameter("ik_max_time", 0.005);  // 5ms max solve time
-        this->declare_parameter("joint_smoothing_factor", 0.3);  // Exponential smoothing
-        this->declare_parameter("max_joint_velocity", 2.0);  // rad/s
         
         // Get parameters
         urdf_path_ = this->get_parameter("robot_urdf_path").as_string();
@@ -50,15 +44,10 @@ public:
         control_frequency_ = this->get_parameter("control_frequency").as_double();
         base_link_ = this->get_parameter("base_link").as_string();
         end_effector_link_ = this->get_parameter("end_effector_link").as_string();
-        control_trigger_ = this->get_parameter("control_trigger").as_string();
-        gripper_trigger_ = this->get_parameter("gripper_trigger").as_string();
-        pose_source_ = this->get_parameter("pose_source").as_string();
         
         ik_pos_tolerance_ = this->get_parameter("ik_position_tolerance").as_double();
         ik_ori_tolerance_ = this->get_parameter("ik_orientation_tolerance").as_double();
         ik_max_time_ = this->get_parameter("ik_max_time").as_double();
-        joint_smoothing_factor_ = this->get_parameter("joint_smoothing_factor").as_double();
-        max_joint_velocity_ = this->get_parameter("max_joint_velocity").as_double();
         
         dt_ = 1.0 / control_frequency_;
         
@@ -71,15 +60,20 @@ public:
         // Initialize transforms
         initializeTransforms();
         
-        // Create service clients
-        xr_pose_client_ = this->create_client<xr_interfaces::srv::GetPose>("/xr/get_pose");
-        xr_key_client_ = this->create_client<xr_interfaces::srv::GetKeyValue>("/xr/get_key_value");
-        xr_button_client_ = this->create_client<xr_interfaces::srv::GetButtonState>("/xr/get_button_state");
+        // Create subscribers for XR data
+        right_grip_sub_ = this->create_subscription<xr_interfaces::msg::KeyValue>(
+            "/xr/right_grip", 10,
+            std::bind(&IKSolverNode::rightGripCallback, this, std::placeholders::_1));
         
-        // Wait for services
-        waitForServices();
+        right_trigger_sub_ = this->create_subscription<xr_interfaces::msg::KeyValue>(
+            "/xr/right_trigger", 10,
+            std::bind(&IKSolverNode::rightTriggerCallback, this, std::placeholders::_1));
         
-        // Create subscribers
+        right_controller_pose_sub_ = this->create_subscription<xr_interfaces::msg::Pose>(
+            "/xr/right_controller_pose", 10,
+            std::bind(&IKSolverNode::rightControllerPoseCallback, this, std::placeholders::_1));
+        
+        // Create subscriber for joint states
         joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states", 10,
             std::bind(&IKSolverNode::jointStateCallback, this, std::placeholders::_1));
@@ -89,6 +83,9 @@ public:
             "/target_joint_positions", 10);
         gripper_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64>(
             "/gripper_command", 10);
+        
+        // Wait for XR topics to be available
+        waitForTopics();
         
         // Create timer
         auto period = std::chrono::duration<double>(dt_);
@@ -110,41 +107,43 @@ private:
     // Joint state
     KDL::JntArray current_joint_positions_;
     KDL::JntArray target_joint_positions_;
-    KDL::JntArray smoothed_joint_positions_;
     std::vector<std::string> joint_names_;
     std::map<std::string, int> joint_name_to_index_;
     int num_joints_;
     bool joints_initialized_ = false;
     
-    // Solution history for consistency
+    // Solution history for fallback
     std::deque<KDL::JntArray> solution_history_;
     const size_t history_size_ = 5;
     
+    // XR data storage
+    double current_grip_value_ = 0.0;
+    double current_trigger_value_ = 0.0;
+    std::vector<double> current_controller_pose_;
+    bool xr_data_received_ = false;
+    
     // Parameters
     std::string urdf_path_, base_link_, end_effector_link_;
-    std::string control_trigger_, gripper_trigger_, pose_source_;
     double scale_factor_;
     double control_frequency_, dt_;
     double ik_pos_tolerance_, ik_ori_tolerance_, ik_max_time_;
-    double joint_smoothing_factor_, max_joint_velocity_;
     
     // Control state
     bool is_active_ = false;
-    bool was_active_ = false;
     KDL::Frame ref_ee_frame_;
-    KDL::Frame current_ee_frame_;
+    bool ref_ee_frame_valid_ = false;
     Eigen::Vector3d ref_controller_pos_;
     Eigen::Quaterniond ref_controller_quat_;
+    bool ref_controller_valid_ = false;
     
     // Transform matrices
     Eigen::Matrix3d R_headset_world_;
     Eigen::Matrix3d R_z_90_cw_;
     
     // ROS interfaces
-    rclcpp::Client<xr_interfaces::srv::GetPose>::SharedPtr xr_pose_client_;
-    rclcpp::Client<xr_interfaces::srv::GetKeyValue>::SharedPtr xr_key_client_;
-    rclcpp::Client<xr_interfaces::srv::GetButtonState>::SharedPtr xr_button_client_;
-    
+    rclcpp::Subscription<xr_interfaces::msg::KeyValue>::SharedPtr right_grip_sub_;
+    rclcpp::Subscription<xr_interfaces::msg::KeyValue>::SharedPtr right_trigger_sub_;
+    rclcpp::Subscription<xr_interfaces::msg::Pose>::SharedPtr right_controller_pose_sub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr target_joint_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gripper_cmd_pub_;
@@ -163,14 +162,14 @@ private:
         std::string urdf_string((std::istreambuf_iterator<char>(urdf_file)),
                                 std::istreambuf_iterator<char>());
         
-        // Initialize TRAC-IK with Distance solve type for consistency
+        // Initialize TRAC-IK - 修正参数顺序
         tracik_solver_ = std::make_unique<TRAC_IK::TRAC_IK>(
-            urdf_string,
-            base_link_,
-            end_effector_link_,
-            ik_max_time_,
-            ik_pos_tolerance_,
-            TRAC_IK::Distance  // This prioritizes solutions close to current joint positions
+            base_link_,              // base
+            end_effector_link_,      // tip
+            urdf_string,             // URDF xml string
+            ik_max_time_,            // 超时时间（秒）
+            ik_pos_tolerance_,       // eps：收敛阈值（位置+姿态误差范数）
+            TRAC_IK::SolveType::Distance  // 解算类型
         );
         
         // Get chain for FK solver
@@ -193,10 +192,10 @@ private:
             return false;
         }
         
-        num_joints_ = tracik_solver_->getNrOfJointsInChain();
+        // 使用正确的方法获取关节数量
+        num_joints_ = kdl_chain_.getNrOfJoints();
         current_joint_positions_.resize(num_joints_);
         target_joint_positions_.resize(num_joints_);
-        smoothed_joint_positions_.resize(num_joints_);
         
         // Initialize FK solver
         fk_solver_ = std::make_unique<KDL::ChainFkSolverPos_recursive>(kdl_chain_);
@@ -231,17 +230,47 @@ private:
                       0, 0, 1;
     }
     
-    void waitForServices()
+    void waitForTopics()
     {
-        RCLCPP_INFO(this->get_logger(), "Waiting for XR services...");
+        RCLCPP_INFO(this->get_logger(), "Waiting for XR topics...");
         
-        while (!xr_pose_client_->wait_for_service(1s)) {
-            if (!rclcpp::ok()) return;
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                "Waiting for XR services...");
+        // 等待所有XR topic都有发布者
+        while (rclcpp::ok()) {
+            auto grip_count = this->count_publishers("/xr/right_grip");
+            auto trigger_count = this->count_publishers("/xr/right_trigger");
+            auto pose_count = this->count_publishers("/xr/right_controller_pose");
+            
+            if (grip_count > 0 && trigger_count > 0 && pose_count > 0) {
+                RCLCPP_INFO(this->get_logger(), "All XR topics are available");
+                break;
+            }
+            
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                "Waiting for XR topics: grip=%ld, trigger=%ld, pose=%ld",
+                                grip_count, trigger_count, pose_count);
+            
+            rclcpp::sleep_for(100ms);
+            rclcpp::spin_some(this->shared_from_this());
         }
-        
-        RCLCPP_INFO(this->get_logger(), "XR services available");
+    }
+    
+    // XR data callbacks
+    void rightGripCallback(const xr_interfaces::msg::KeyValue::SharedPtr msg)
+    {
+        current_grip_value_ = msg->value;
+        xr_data_received_ = true;
+    }
+    
+    void rightTriggerCallback(const xr_interfaces::msg::KeyValue::SharedPtr msg)
+    {
+        current_trigger_value_ = msg->value;
+    }
+    
+    void rightControllerPoseCallback(const xr_interfaces::msg::Pose::SharedPtr msg)
+    {
+        if (msg->pose.size() >= 7) {
+            current_controller_pose_ = msg->pose;
+        }
     }
     
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
@@ -254,9 +283,8 @@ private:
             }
         }
         
-        // Initialize smoothed positions on first callback
+        // Initialize on first callback
         if (!joints_initialized_) {
-            smoothed_joint_positions_ = current_joint_positions_;
             target_joint_positions_ = current_joint_positions_;
             joints_initialized_ = true;
             RCLCPP_INFO(this->get_logger(), "Joints initialized from joint_states");
@@ -277,9 +305,10 @@ private:
         controller_quat = R_quat * controller_quat * R_quat.conjugate();
         
         // Calculate deltas
-        if (!was_active_) {
+        if (!ref_controller_valid_) {
             ref_controller_pos_ = controller_pos;
             ref_controller_quat_ = controller_quat;
+            ref_controller_valid_ = true;
             delta_pos.setZero();
             delta_rot.setZero();
         } else {
@@ -298,190 +327,119 @@ private:
     
     bool solveIKWithConsistency(const KDL::Frame& target_frame, KDL::JntArray& solution)
     {
-        // Use current positions as seed for Distance solve type
-        KDL::JntArray seed = smoothed_joint_positions_;
+        // 使用当前关节位置作为种子
+        KDL::JntArray seed = current_joint_positions_;
         
-        // Solve IK with relaxed orientation tolerance
-        int ret = tracik_solver_->CartToJnt(seed, target_frame, solution, 
-                                           KDL::Twist(KDL::Vector(ik_pos_tolerance_, ik_pos_tolerance_, ik_pos_tolerance_),
-                                                     KDL::Vector(ik_ori_tolerance_, ik_ori_tolerance_, ik_ori_tolerance_)));
-        
-        if (ret < 0) {
-            // Try with more relaxed orientation if first attempt fails
-            ret = tracik_solver_->CartToJnt(seed, target_frame, solution,
-                                           KDL::Twist(KDL::Vector(ik_pos_tolerance_, ik_pos_tolerance_, ik_pos_tolerance_),
-                                                     KDL::Vector(ik_ori_tolerance_*2, ik_ori_tolerance_*2, ik_ori_tolerance_*2)));
-        }
+        // 直接求解IK
+        int ret = tracik_solver_->CartToJnt(seed, target_frame, solution);
         
         if (ret >= 0) {
-            // Check for joint jumps
-            bool has_jump = false;
-            for (int i = 0; i < num_joints_; ++i) {
-                double diff = std::abs(solution(i) - smoothed_joint_positions_(i));
-                if (diff > M_PI) {  // Check for wrap-around
-                    diff = 2*M_PI - diff;
-                }
-                if (diff > max_joint_velocity_ * dt_) {
-                    has_jump = true;
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                                       "Joint %d jump detected: %.3f rad", i, diff);
-                }
-            }
-            
-            // If jump detected, use smoothing to limit velocity
-            if (has_jump) {
-                for (int i = 0; i < num_joints_; ++i) {
-                    double diff = solution(i) - smoothed_joint_positions_(i);
-                    // Handle angle wrap
-                    if (diff > M_PI) diff -= 2*M_PI;
-                    if (diff < -M_PI) diff += 2*M_PI;
-                    
-                    // Limit velocity
-                    double max_change = max_joint_velocity_ * dt_;
-                    diff = std::max(-max_change, std::min(max_change, diff));
-                    solution(i) = smoothed_joint_positions_(i) + diff;
-                }
-            }
-            
             return true;
         }
         
-        return false;
-    }
-    
-    void smoothJointPositions(const KDL::JntArray& target)
-    {
-        // Exponential smoothing with angle wrap handling
-        for (int i = 0; i < num_joints_; ++i) {
-            double diff = target(i) - smoothed_joint_positions_(i);
-            
-            // Handle angle wrapping
-            if (diff > M_PI) diff -= 2*M_PI;
-            if (diff < -M_PI) diff += 2*M_PI;
-            
-            smoothed_joint_positions_(i) += joint_smoothing_factor_ * diff;
-            
-            // Normalize to [-pi, pi]
-            while (smoothed_joint_positions_(i) > M_PI)
-                smoothed_joint_positions_(i) -= 2*M_PI;
-            while (smoothed_joint_positions_(i) < -M_PI)
-                smoothed_joint_positions_(i) += 2*M_PI;
-        }
+        // 如果失败，尝试用更宽松的容差
+        ret = tracik_solver_->CartToJnt(seed, target_frame, solution,
+                                       KDL::Twist(KDL::Vector(ik_pos_tolerance_*2, ik_pos_tolerance_*2, ik_pos_tolerance_*2),
+                                                 KDL::Vector(ik_ori_tolerance_*3, ik_ori_tolerance_*3, ik_ori_tolerance_*3)));
+        
+        return ret >= 0;
     }
     
     void controlLoop()
     {
-        if (!joints_initialized_) {
-            RCLCPP_DEBUG(this->get_logger(), "Waiting for joint states...");
+        if (!joints_initialized_ || !xr_data_received_) {
+            RCLCPP_DEBUG(this->get_logger(), "Waiting for joint states and XR data...");
             return;
         }
         
-        // Get grip value
-        auto grip_request = std::make_shared<xr_interfaces::srv::GetKeyValue::Request>();
-        grip_request->name = control_trigger_;
-        auto grip_future = xr_key_client_->async_send_request(grip_request);
+        // Check activation state
+        bool new_active = (current_grip_value_ > 0.9);
         
-        if (grip_future.wait_for(10ms) != std::future_status::ready) {
-            return;
-        }
-        
-        auto grip_response = grip_future.get();
-        if (!grip_response->success) return;
-        
-        is_active_ = (grip_response->value > 0.9);
-        
-        // Handle activation/deactivation
-        if (is_active_ && !was_active_) {
-            RCLCPP_INFO(this->get_logger(), "Control activated");
-            
-            // Get current end-effector pose
-            fk_solver_->JntToCart(current_joint_positions_, current_ee_frame_);
-            ref_ee_frame_ = current_ee_frame_;
-            was_active_ = true;
-            
-            // Clear solution history
-            solution_history_.clear();
-            
-        } else if (!is_active_ && was_active_) {
-            RCLCPP_INFO(this->get_logger(), "Control deactivated");
-            was_active_ = false;
-        }
-        
-        // Process control
-        if (is_active_) {
-            // Get controller pose
-            auto pose_request = std::make_shared<xr_interfaces::srv::GetPose::Request>();
-            pose_request->name = pose_source_;
-            auto pose_future = xr_pose_client_->async_send_request(pose_request);
-            
-            if (pose_future.wait_for(10ms) == std::future_status::ready) {
-                auto pose_response = pose_future.get();
+        if (new_active != is_active_) {
+            if (new_active) {
+                RCLCPP_INFO(this->get_logger(), "Control activated");
                 
-                if (pose_response->success && pose_response->pose.size() >= 7) {
-                    // Calculate deltas
-                    Eigen::Vector3d delta_pos, delta_rot;
-                    processControllerPose(pose_response->pose, delta_pos, delta_rot);
+                // 重新初始化参考姿态
+                fk_solver_->JntToCart(current_joint_positions_, ref_ee_frame_);
+                ref_ee_frame_valid_ = true;
+                ref_controller_valid_ = false;  // 强制重新初始化控制器参考
+                
+            } else {
+                RCLCPP_INFO(this->get_logger(), "Control deactivated");
+                
+                // 清除参考值
+                ref_ee_frame_valid_ = false;
+                ref_controller_valid_ = false;
+            }
+            
+            is_active_ = new_active;
+        }
+        
+        // Process control if active
+        if (is_active_ && current_controller_pose_.size() >= 7) {
+            // Calculate deltas
+            Eigen::Vector3d delta_pos, delta_rot;
+            processControllerPose(current_controller_pose_, delta_pos, delta_rot);
+            
+            if (ref_ee_frame_valid_) {
+                // Create target frame
+                KDL::Frame target_frame = ref_ee_frame_;
+                target_frame.p = target_frame.p + KDL::Vector(delta_pos[0], delta_pos[1], delta_pos[2]);
+                
+                // Apply rotation
+                double angle = delta_rot.norm();
+                if (angle > 1e-6) {
+                    KDL::Vector axis(delta_rot[0]/angle, delta_rot[1]/angle, delta_rot[2]/angle);
+                    KDL::Rotation delta_rotation = KDL::Rotation::Rot(axis, angle);
+                    target_frame.M = delta_rotation * target_frame.M;
+                }
+                
+                // Solve IK
+                KDL::JntArray ik_solution(num_joints_);
+                if (solveIKWithConsistency(target_frame, ik_solution)) {
+                    target_joint_positions_ = ik_solution;
                     
-                    // Create target frame
-                    KDL::Frame target_frame = ref_ee_frame_;
-                    target_frame.p = target_frame.p + KDL::Vector(delta_pos[0], delta_pos[1], delta_pos[2]);
-                    
-                    // Apply rotation
-                    double angle = delta_rot.norm();
-                    if (angle > 1e-6) {
-                        KDL::Vector axis(delta_rot[0]/angle, delta_rot[1]/angle, delta_rot[2]/angle);
-                        KDL::Rotation delta_rotation = KDL::Rotation::Rot(axis, angle);
-                        target_frame.M = delta_rotation * target_frame.M;
+                    // Store in history
+                    solution_history_.push_back(ik_solution);
+                    if (solution_history_.size() > history_size_) {
+                        solution_history_.pop_front();
                     }
                     
-                    // Solve IK with consistency check
-                    KDL::JntArray ik_solution(num_joints_);
-                    if (solveIKWithConsistency(target_frame, ik_solution)) {
-                        // Smooth the solution
-                        smoothJointPositions(ik_solution);
-                        
-                        // Publish target
-                        sensor_msgs::msg::JointState target_msg;
-                        target_msg.header.stamp = this->now();
-                        target_msg.name = joint_names_;
-                        target_msg.position.resize(num_joints_);
-                        
-                        for (int i = 0; i < num_joints_; ++i) {
-                            target_msg.position[i] = smoothed_joint_positions_(i);
-                        }
-                        
-                        target_joint_pub_->publish(target_msg);
-                        
-                        // Store in history
-                        solution_history_.push_back(smoothed_joint_positions_);
-                        if (solution_history_.size() > history_size_) {
-                            solution_history_.pop_front();
-                        }
-                        
-                    } else {
-                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                                           "IK solution not found");
+                } else {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                                       "IK solution not found, using last solution");
+                    
+                    // Use last successful solution if available
+                    if (!solution_history_.empty()) {
+                        target_joint_positions_ = solution_history_.back();
                     }
                 }
             }
-        } else {
-            // When not active, slowly move smoothed positions toward current
-            smoothJointPositions(current_joint_positions_);
-        }
-        
-        // Update gripper
-        auto trigger_request = std::make_shared<xr_interfaces::srv::GetKeyValue::Request>();
-        trigger_request->name = gripper_trigger_;
-        auto trigger_future = xr_key_client_->async_send_request(trigger_request);
-        
-        if (trigger_future.wait_for(10ms) == std::future_status::ready) {
-            auto trigger_response = trigger_future.get();
-            if (trigger_response->success) {
-                std_msgs::msg::Float64 gripper_msg;
-                gripper_msg.data = trigger_response->value;
-                gripper_cmd_pub_->publish(gripper_msg);
+        } else if (!is_active_) {
+            // When not active, use last successful solution or current position
+            if (!solution_history_.empty()) {
+                target_joint_positions_ = solution_history_.back();
+            } else {
+                target_joint_positions_ = current_joint_positions_;
             }
         }
+        
+        // Publish target joint positions
+        sensor_msgs::msg::JointState target_msg;
+        target_msg.header.stamp = this->now();
+        target_msg.name = joint_names_;
+        target_msg.position.resize(num_joints_);
+        
+        for (int i = 0; i < num_joints_; ++i) {
+            target_msg.position[i] = target_joint_positions_(i);
+        }
+        
+        target_joint_pub_->publish(target_msg);
+        
+        // Publish gripper command
+        std_msgs::msg::Float64 gripper_msg;
+        gripper_msg.data = current_trigger_value_;
+        gripper_cmd_pub_->publish(gripper_msg);
     }
 };
 
