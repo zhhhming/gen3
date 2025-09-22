@@ -1,0 +1,5 @@
+string name  # A, B, X, Y, left_menu_button, right_menu_button, left_axis_click, right_axis_click
+---
+bool success
+bool pressed
+string error_message

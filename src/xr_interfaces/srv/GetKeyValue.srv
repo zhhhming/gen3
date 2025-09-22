@@ -1,0 +1,5 @@
+string name  # left_trigger, right_trigger, left_grip, right_grip
+---
+bool success
+float64 value  # 0.0 - 1.0
+string error_message

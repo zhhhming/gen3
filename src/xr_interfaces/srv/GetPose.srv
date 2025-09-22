@@ -1,0 +1,5 @@
+string name  # left_controller, right_controller, headset
+---
+bool success
+float64[] pose  # [x, y, z, qx, qy, qz, qw]
+string error_message
