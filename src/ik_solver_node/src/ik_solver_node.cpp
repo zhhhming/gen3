@@ -5,6 +5,8 @@
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2_kdl/tf2_kdl.hpp>
+#include <fstream>
+#include <map>
 
 #include <trac_ik/trac_ik.hpp>
 #include <kdl_parser/kdl_parser.hpp>
@@ -27,9 +29,9 @@ public:
     IKSolverNode() : Node("ik_solver_node")
     {
         // Declare parameters
-        this->declare_parameter("robot_urdf_path", "/path/to/robot.urdf");
+        this->declare_parameter("robot_urdf_path", "/home/ming/xrrobotics_new/XRoboToolkit-Teleop-Sample-Python/assets/arx/Gen/GEN3-7DOF.urdf");
         this->declare_parameter("scale_factor", 1.0);
-        this->declare_parameter("control_frequency", 50.0);
+        this->declare_parameter("control_frequency", 200.0);
         this->declare_parameter("base_link", "base_link");
         this->declare_parameter("end_effector_link", "bracelet_link");
         
@@ -116,7 +118,7 @@ private:
     std::deque<KDL::JntArray> solution_history_;
     const size_t history_size_ = 5;
     
-    // XR data storage
+    // XR data storagewaitForTopics
     double current_grip_value_ = 0.0;
     double current_trigger_value_ = 0.0;
     std::vector<double> current_controller_pose_;
@@ -250,7 +252,6 @@ private:
                                 grip_count, trigger_count, pose_count);
             
             rclcpp::sleep_for(100ms);
-            rclcpp::spin_some(this->shared_from_this());
         }
     }
     

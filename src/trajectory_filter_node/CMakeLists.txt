@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(ik_solver_node)
+project(trajectory_filter_node)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -10,36 +10,21 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
-find_package(geometry_msgs REQUIRED)
-find_package(tf2 REQUIRED)
-find_package(tf2_ros REQUIRED)
-find_package(kdl_parser REQUIRED)
-find_package(urdf REQUIRED)
-find_package(xr_interfaces REQUIRED)
-find_package(tf2_kdl REQUIRED)
-find_package(trac_ik_lib REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 
-# Add executable
-add_executable(ik_solver_node src/ik_solver_node.cpp)
+add_executable(trajectory_filter_node src/trajectory_filter_node.cpp)
 
 # Target dependencies
-ament_target_dependencies(ik_solver_node
+ament_target_dependencies(trajectory_filter_node
   rclcpp
   sensor_msgs
   std_msgs
-  geometry_msgs
-  tf2
-  tf2_ros
-  kdl_parser
-  urdf
-  xr_interfaces
-  tf2_kdl
-  trac_ik_lib
+  trajectory_msgs
 )
 
 # Install targets
 install(TARGETS
-  ik_solver_node
+  trajectory_filter_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
