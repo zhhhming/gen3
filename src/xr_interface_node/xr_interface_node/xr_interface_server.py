@@ -3,6 +3,7 @@
 import rclpy
 from rclpy.node import Node
 from xr_interfaces.srv import GetPose, GetKeyValue, GetButtonState
+from xr_interfaces.msg import KeyValue, Pose
 import numpy as np
 import threading
 
@@ -27,7 +28,7 @@ class XRInterfaceNode(Node):
         # Initialize XR SDK
         self._init_xr_sdk()
         
-        # Create service servers
+        # Create service servers (保留button state服务)
         self.pose_service = self.create_service(
             GetPose, 
             'xr/get_pose', 
@@ -46,6 +47,28 @@ class XRInterfaceNode(Node):
             self.get_button_state_callback
         )
         
+        # Create publishers for high-frequency data
+        self.right_grip_pub = self.create_publisher(
+            KeyValue, 
+            'xr/right_grip', 
+            10
+        )
+        
+        self.right_trigger_pub = self.create_publisher(
+            KeyValue, 
+            'xr/right_trigger', 
+            10
+        )
+        
+        self.right_controller_pose_pub = self.create_publisher(
+            Pose, 
+            'xr/right_controller_pose', 
+            10
+        )
+        
+        # Create timer for 500Hz publishing (0.002 seconds = 2ms)
+        self.publish_timer = self.create_timer(0.004, self.publish_high_freq_data)
+        
         # Thread lock for SDK access
         self.sdk_lock = threading.Lock()
         
@@ -54,6 +77,10 @@ class XRInterfaceNode(Node):
         self.get_logger().info('  - /xr/get_pose')
         self.get_logger().info('  - /xr/get_key_value')
         self.get_logger().info('  - /xr/get_button_state')
+        self.get_logger().info('Topics publishing at 500Hz:')
+        self.get_logger().info('  - /xr/right_grip')
+        self.get_logger().info('  - /xr/right_trigger')
+        self.get_logger().info('  - /xr/right_controller_pose')
 
     def _init_xr_sdk(self):
         """Initialize the XR SDK"""
@@ -63,6 +90,32 @@ class XRInterfaceNode(Node):
         except Exception as e:
             self.get_logger().error(f'Failed to initialize XR SDK: {str(e)}')
             raise
+
+    def publish_high_freq_data(self):
+        """Publish high-frequency data at 500Hz"""
+        with self.sdk_lock:
+            try:
+                # Publish right grip value
+                right_grip_msg = KeyValue()
+                right_grip_msg.name = "right_grip"
+                right_grip_msg.value = float(xrt.get_right_grip())
+                self.right_grip_pub.publish(right_grip_msg)
+                
+                # Publish right trigger value
+                right_trigger_msg = KeyValue()
+                right_trigger_msg.name = "right_trigger"
+                right_trigger_msg.value = float(xrt.get_right_trigger())
+                self.right_trigger_pub.publish(right_trigger_msg)
+                
+                # Publish right controller pose
+                right_controller_pose_msg = Pose()
+                right_controller_pose_msg.name = "right_controller"
+                pose_array = xrt.get_right_controller_pose()
+                right_controller_pose_msg.pose = pose_array.tolist() if isinstance(pose_array, np.ndarray) else list(pose_array)
+                self.right_controller_pose_pub.publish(right_controller_pose_msg)
+                
+            except Exception as e:
+                self.get_logger().error(f"Error publishing high-frequency data: {str(e)}")
 
     def get_pose_callback(self, request, response):
         """Handle get_pose service requests"""

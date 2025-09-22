@@ -14,6 +14,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetPose.srv"
   "srv/GetKeyValue.srv"
   "srv/GetButtonState.srv"
+  "msg/KeyValue.msg"
+  "msg/Pose.msg"
 )
 
 ament_export_dependencies(rosidl_default_runtime)
