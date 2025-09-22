@@ -19,7 +19,7 @@ public:
     TrajectoryFilterNode() : Node("trajectory_filter_node")
     {
         // Declare parameters
-        this->declare_parameter("filter_alpha", 0.3);  // 低通滤波系数 (0-1)
+        this->declare_parameter("filter_alpha", 0.15);  // 低通滤波系数 (0-1)
         this->declare_parameter("control_rate", 100.0);  // 控制频率Hz
         this->declare_parameter("filter_deadband", 0.001);  // 死区阈值(弧度)
         this->declare_parameter("trajectory_duration", 0.1);  // 轨迹持续时间(秒)

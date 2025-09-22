@@ -20,7 +20,10 @@
 #include <memory>
 #include <chrono>
 #include <deque>
-
+#include <vector>
+#include <string>
+#include <Eigen/Core>
+#include <Eigen/Geometry>
 using namespace std::chrono_literals;
 
 class IKSolverNode : public rclcpp::Node
