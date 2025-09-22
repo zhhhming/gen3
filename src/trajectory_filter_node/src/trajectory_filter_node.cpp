@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <chrono>
+#include <cmath>  // 用于M_PI
 
 using namespace std::chrono_literals;
 
@@ -185,10 +186,39 @@ private:
         joint_states_received_ = true;
     }
     
+    double normalizeAngleRad(double angle_rad) const
+    {
+        // 将角度归一化到 [-π, π] 范围
+        while (angle_rad > M_PI) {
+            angle_rad -= 2.0 * M_PI;
+        }
+        while (angle_rad < -M_PI) {
+            angle_rad += 2.0 * M_PI;
+        }
+        return angle_rad;
+    }
+    
+    double toNearestEquivalentAngle(double target_rad, double current_rad) const
+    {
+        // 将目标角度调整为离当前角度最近的等效角度
+        // 例如：current=3.0, target=-3.1 -> 返回 3.28 (而不是 -3.1)
+        
+        double diff = target_rad - current_rad;
+        
+        // 归一化差值到 [-π, π]
+        diff = normalizeAngleRad(diff);
+        
+        // 返回最近的等效角度
+        return current_rad + diff;
+    }
+    
     void applyLowPassFilter()
     {
         for (size_t i = 0; i < num_joints_; ++i) {
-            double error = target_positions_[i] - filtered_positions_[i];
+            // 角度连续性处理：将目标角度调整为最近的等效角度
+            double adjusted_target = toNearestEquivalentAngle(target_positions_[i], filtered_positions_[i]);
+            
+            double error = adjusted_target - filtered_positions_[i];
             
             // 死区处理
             if (std::abs(error) < filter_deadband_) {
@@ -196,8 +226,11 @@ private:
             }
             
             // 低通滤波：y[n] = alpha * x[n] + (1-alpha) * y[n-1]
-            filtered_positions_[i] = filter_alpha_ * target_positions_[i] + 
+            filtered_positions_[i] = filter_alpha_ * adjusted_target + 
                                    (1.0 - filter_alpha_) * filtered_positions_[i];
+            
+            // 确保输出角度在 [-π, π] 范围内
+            filtered_positions_[i] = normalizeAngleRad(filtered_positions_[i]);
         }
     }
     
