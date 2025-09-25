@@ -16,6 +16,11 @@
 #include <string>
 #include <memory>
 #include <fstream>
+#include <cmath>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 class ArmVisualizerNode : public rclcpp::Node
 {
@@ -81,6 +86,30 @@ private:
     std::map<std::string, std::shared_ptr<KDL::ChainFkSolverPos_recursive>> fk_solvers_;
     std::vector<std::string> joint_names_;
     std::map<std::string, int> joint_name_to_index_;
+    std::map<std::string, std::pair<double, double>> joint_limits_; // 存储关节限制
+    
+    // 检查并裁剪关节角度到限制范围
+    double clampJointValue(const std::string& joint_name, double value)
+    {
+        auto it = joint_limits_.find(joint_name);
+        if (it != joint_limits_.end()) {
+            double lower = it->second.first;
+            double upper = it->second.second;
+            
+            if (value < lower) {
+                RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "Joint %s value %.3f below lower limit %.3f, clamping", 
+                                     joint_name.c_str(), value, lower);
+                return lower;
+            } else if (value > upper) {
+                RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "Joint %s value %.3f above upper limit %.3f, clamping", 
+                                     joint_name.c_str(), value, upper);
+                return upper;
+            }
+        }
+        return value;
+    }
     
     // 关节状态
     std::map<std::string, double> current_joint_positions_;
@@ -119,37 +148,82 @@ private:
             return false;
         }
         
-        // 获取所有关节信息
+        // 获取所有关节信息和限制
         for (const auto& joint_pair : urdf_model_.joints_) {
             const auto& joint = joint_pair.second;
             if (joint->type != urdf::Joint::FIXED && joint->type != urdf::Joint::FLOATING) {
                 joint_names_.push_back(joint->name);
                 joint_name_to_index_[joint->name] = joint_names_.size() - 1;
                 
-                // 为每个关节创建到base_link的链
-                KDL::Chain chain;
-                if (kdl_tree_.getChain(base_link_, joint->child_link_name, chain)) {
-                    joint_chains_[joint->name] = chain;
-                    fk_solvers_[joint->name] = std::make_shared<KDL::ChainFkSolverPos_recursive>(chain);
-                    RCLCPP_INFO(this->get_logger(), "Created chain for joint: %s -> %s", 
-                               base_link_.c_str(), joint->child_link_name.c_str());
+                // 收集关节限制
+                if (joint->limits) {
+                    joint_limits_[joint->name] = std::make_pair(joint->limits->lower, joint->limits->upper);
+                    RCLCPP_INFO(this->get_logger(), "Joint %s: limits [%.3f, %.3f] (type: %d)", 
+                               joint->name.c_str(), joint->limits->lower, joint->limits->upper, joint->type);
+                } else {
+                    // 对于没有限制的关节，使用默认值
+                    joint_limits_[joint->name] = std::make_pair(-M_PI, M_PI);
+                    RCLCPP_INFO(this->get_logger(), "Joint %s: no limits, using [-π, π] (type: %d)", 
+                               joint->name.c_str(), joint->type);
                 }
             }
         }
         
-        // 为所有link创建FK链
+        // 只为每个连杆创建一次FK链，并验证链的有效性
         for (const auto& link_pair : urdf_model_.links_) {
             const std::string& link_name = link_pair.first;
             if (link_name != base_link_) {
                 KDL::Chain chain;
                 if (kdl_tree_.getChain(base_link_, link_name, chain)) {
-                    joint_chains_[link_name] = chain;
-                    fk_solvers_[link_name] = std::make_shared<KDL::ChainFkSolverPos_recursive>(chain);
+                    // 验证链的结构
+                    bool chain_valid = true;
+                    RCLCPP_INFO(this->get_logger(), "Chain %s -> %s has %d segments:", 
+                               base_link_.c_str(), link_name.c_str(), chain.getNrOfSegments());
+                    
+                    int active_joints = 0;
+                    for (unsigned int i = 0; i < chain.getNrOfSegments(); ++i) {
+                        const KDL::Segment& segment = chain.getSegment(i);
+                        const KDL::Joint& joint = segment.getJoint();
+                        
+                        RCLCPP_INFO(this->get_logger(), "  Segment %d: %s, Joint: %s (type: %d)", 
+                                   i, segment.getName().c_str(), joint.getName().c_str(), joint.getType());
+                        
+                        if (joint.getType() != KDL::Joint::None) {
+                            active_joints++;
+                        }
+                    }
+                    
+                    RCLCPP_INFO(this->get_logger(), "  Active joints: %d", active_joints);
+                    
+                    if (active_joints > 0) {
+                        joint_chains_[link_name] = chain;
+                        fk_solvers_[link_name] = std::make_shared<KDL::ChainFkSolverPos_recursive>(chain);
+                        
+                        // 测试FK求解器，使用零位置
+                        KDL::JntArray zero_joints(active_joints);
+                        KDL::Frame test_frame;
+                        for (int j = 0; j < active_joints; j++) {
+                            zero_joints(j) = 0.0;
+                        }
+                        
+                        int test_result = fk_solvers_[link_name]->JntToCart(zero_joints, test_frame);
+                        if (test_result >= 0) {
+                            RCLCPP_INFO(this->get_logger(), "  FK solver test PASSED for %s", link_name.c_str());
+                        } else {
+                            RCLCPP_WARN(this->get_logger(), "  FK solver test FAILED for %s (error: %d)", 
+                                       link_name.c_str(), test_result);
+                        }
+                    } else {
+                        RCLCPP_DEBUG(this->get_logger(), "Skipping %s - no active joints", link_name.c_str());
+                    }
+                } else {
+                    RCLCPP_WARN(this->get_logger(), "Failed to get chain: %s -> %s", 
+                               base_link_.c_str(), link_name.c_str());
                 }
             }
         }
         
-        RCLCPP_INFO(this->get_logger(), "Found %zu joints and %zu links", 
+        RCLCPP_INFO(this->get_logger(), "Initialized: %zu joints, %zu links with FK chains", 
                    joint_names_.size(), joint_chains_.size());
         
         return true;
@@ -229,7 +303,7 @@ private:
             KDL::JntArray joint_array(chain.getNrOfJoints());
             int joint_idx = 0;
             
-            // 填充关节位置
+            // 填充关节位置并进行详细调试
             for (unsigned int i = 0; i < chain.getNrOfSegments(); ++i) {
                 const KDL::Segment& segment = chain.getSegment(i);
                 const KDL::Joint& joint = segment.getJoint();
@@ -238,18 +312,47 @@ private:
                     std::string joint_name = joint.getName();
                     auto it = joint_positions.find(joint_name);
                     if (it != joint_positions.end()) {
-                        joint_array(joint_idx) = it->second;
+                        // 检查数值有效性
+                        if (std::isnan(it->second) || std::isinf(it->second)) {
+                            RCLCPP_WARN(this->get_logger(), "Invalid joint value for %s: %f", 
+                                       joint_name.c_str(), it->second);
+                            joint_array(joint_idx) = 0.0;
+                        } else {
+                            // 应用关节限制裁剪
+                            double clamped_value = clampJointValue(joint_name, it->second);
+                            joint_array(joint_idx) = clamped_value;
+                            
+                            // 记录原始值和裁剪值的差异
+                            if (std::abs(clamped_value - it->second) > 1e-6) {
+                                RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                                     "Joint %s: %.3f -> %.3f (clamped)", 
+                                                     joint_name.c_str(), it->second, clamped_value);
+                            }
+                        }
                     } else {
-                        joint_array(joint_idx) = 0.0; // 默认值
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                            "Joint %s not found in joint_positions for link %s", 
+                                            joint_name.c_str(), link_name.c_str());
+                        joint_array(joint_idx) = 0.0;
                     }
                     joint_idx++;
                 }
             }
             
+            // 检查FK求解器
+            auto it_fk = fk_solvers_.find(link_name);
+            if (it_fk == fk_solvers_.end() || !it_fk->second) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                    "No FK solver for link '%s'", link_name.c_str());
+                continue;
+            }
+            
             // 计算正向运动学
             KDL::Frame result_frame;
-            auto fk_solver = fk_solvers_[link_name];
-            if (fk_solver && fk_solver->JntToCart(joint_array, result_frame) >= 0) {
+            auto& fk_solver = it_fk->second;
+            int fk_result = fk_solver->JntToCart(joint_array, result_frame);
+            
+            if (fk_result >= 0) {
                 // 创建变换消息
                 geometry_msgs::msg::TransformStamped transform;
                 transform.header.stamp = timestamp;
@@ -270,8 +373,26 @@ private:
                 transform.transform.rotation.w = w;
                 
                 transforms.push_back(transform);
+                
+                RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                     "FK success for %s: pos[%.3f,%.3f,%.3f]", 
+                                     link_name.c_str(), result_frame.p.x(), result_frame.p.y(), result_frame.p.z());
+            } else {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                    "FK failed for link '%s' with error code: %d", 
+                                    link_name.c_str(), fk_result);
+                
+                // 打印详细的调试信息
+                RCLCPP_DEBUG(this->get_logger(), "Chain for '%s' has %d joints:", 
+                           link_name.c_str(), chain.getNrOfJoints());
+                for (int j = 0; j < joint_array.rows(); j++) {
+                    RCLCPP_DEBUG(this->get_logger(), "  Joint %d: %.6f", j, joint_array(j));
+                }
             }
         }
+        
+        RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
+                             "[%s] Publishing %zu TFs (including base)", prefix.c_str(), transforms.size());
     }
 };
 
