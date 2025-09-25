@@ -35,7 +35,7 @@ public:
         // 定义关节名称 (根据你的机器人配置调整)
         joint_names_ = {
             "joint_1", "joint_2", "joint_3", "joint_4", 
-            "joint_5", "joint_6", "right_finger_bottom_joint"
+            "joint_5", "joint_6", "joint_7","right_finger_bottom_joint"
         };
         
         num_joints_ = joint_names_.size();
@@ -214,7 +214,7 @@ private:
     
     void applyLowPassFilter()
     {
-        for (size_t i = 0; i < num_joints_; ++i) {
+        for (size_t i = 0; i < num_joints_-1; ++i) {
             // 角度连续性处理：将目标角度调整为最近的等效角度
             double adjusted_target = toNearestEquivalentAngle(target_positions_[i], filtered_positions_[i]);
             
