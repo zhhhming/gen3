@@ -34,7 +34,7 @@ public:
         // Declare parameters
         this->declare_parameter("robot_urdf_path", "/home/ming/xrrobotics_new/XRoboToolkit-Teleop-Sample-Python/assets/arx/Gen/GEN3-7DOF.urdf");
         this->declare_parameter("scale_factor", 1.0);
-        this->declare_parameter("control_frequency", 200.0);
+        this->declare_parameter("control_frequency", 50.0);
         this->declare_parameter("base_link", "base_link");
         this->declare_parameter("end_effector_link", "bracelet_link");
         
@@ -121,7 +121,7 @@ private:
     std::deque<KDL::JntArray> solution_history_;
     const size_t history_size_ = 5;
     
-    // XR data storagewaitForTopics
+    // XR data storage
     double current_grip_value_ = 0.0;
     double current_trigger_value_ = 0.0;
     std::vector<double> current_controller_pose_;
