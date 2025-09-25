@@ -1,47 +1,35 @@
 #include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float64.hpp>
-#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
-#include <tf2_kdl/tf2_kdl.hpp>
+#include <kdl_parser/kdl_parser.hpp>
+#include <kdl/chainfksolverpos_recursive.hpp>
 #include <fstream>
 #include <map>
-
-#include <trac_ik/trac_ik.hpp>
-#include <kdl_parser/kdl_parser.hpp>
-#include <kdl/chainiksolverpos_nr.hpp>
-#include <kdl/chainfksolverpos_recursive.hpp>
+#include <memory>
+#include <chrono>
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
 
 #include "xr_interfaces/msg/key_value.hpp"
 #include "xr_interfaces/msg/pose.hpp"
 
-#include <Eigen/Dense>
-#include <memory>
-#include <chrono>
-#include <deque>
-#include <vector>
-#include <string>
-#include <Eigen/Core>
-#include <Eigen/Geometry>
 using namespace std::chrono_literals;
 
-class IKSolverNode : public rclcpp::Node
+class CartesianTargetNode : public rclcpp::Node
 {
 public:
-    IKSolverNode() : Node("ik_solver_node")
+    CartesianTargetNode() : Node("cartesian_target_node")
     {
         // Declare parameters
         this->declare_parameter("robot_urdf_path", "/home/ming/xrrobotics_new/XRoboToolkit-Teleop-Sample-Python/assets/arx/Gen/GEN3-7DOF.urdf");
         this->declare_parameter("scale_factor", 1.0);
-        this->declare_parameter("control_frequency", 300.0);
+        this->declare_parameter("control_frequency", 100.0);
         this->declare_parameter("base_link", "base_link");
         this->declare_parameter("end_effector_link", "bracelet_link");
-        
-        // IK parameters
-        this->declare_parameter("ik_position_tolerance", 0.001);  // 1mm
-        this->declare_parameter("ik_orientation_tolerance", 0.01); // ~0.57 degrees
-        this->declare_parameter("ik_max_time", 0.005);  // 5ms max solve time
         
         // Get parameters
         urdf_path_ = this->get_parameter("robot_urdf_path").as_string();
@@ -50,16 +38,12 @@ public:
         base_link_ = this->get_parameter("base_link").as_string();
         end_effector_link_ = this->get_parameter("end_effector_link").as_string();
         
-        ik_pos_tolerance_ = this->get_parameter("ik_position_tolerance").as_double();
-        ik_ori_tolerance_ = this->get_parameter("ik_orientation_tolerance").as_double();
-        ik_max_time_ = this->get_parameter("ik_max_time").as_double();
-        
         dt_ = 1.0 / control_frequency_;
         
-        // Initialize TRAC-IK
-        if (!initializeTracIK()) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to initialize TRAC-IK");
-            throw std::runtime_error("TRAC-IK initialization failed");
+        // Initialize FK solver
+        if (!initializeFKSolver()) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to initialize FK solver");
+            throw std::runtime_error("FK solver initialization failed");
         }
         
         // Initialize transforms
@@ -68,58 +52,59 @@ public:
         // Create subscribers for XR data
         right_grip_sub_ = this->create_subscription<xr_interfaces::msg::KeyValue>(
             "/xr/right_grip", 10,
-            std::bind(&IKSolverNode::rightGripCallback, this, std::placeholders::_1));
+            std::bind(&CartesianTargetNode::rightGripCallback, this, std::placeholders::_1));
         
         right_trigger_sub_ = this->create_subscription<xr_interfaces::msg::KeyValue>(
             "/xr/right_trigger", 10,
-            std::bind(&IKSolverNode::rightTriggerCallback, this, std::placeholders::_1));
+            std::bind(&CartesianTargetNode::rightTriggerCallback, this, std::placeholders::_1));
         
         right_controller_pose_sub_ = this->create_subscription<xr_interfaces::msg::Pose>(
             "/xr/right_controller_pose", 10,
-            std::bind(&IKSolverNode::rightControllerPoseCallback, this, std::placeholders::_1));
+            std::bind(&CartesianTargetNode::rightControllerPoseCallback, this, std::placeholders::_1));
         
         // Create subscriber for joint states
         joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states", 10,
-            std::bind(&IKSolverNode::jointStateCallback, this, std::placeholders::_1));
+            std::bind(&CartesianTargetNode::jointStateCallback, this, std::placeholders::_1));
         
         // Create publishers
-        target_joint_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(
-            "/target_joint_positions", 10);
+        target_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+            "/cartesian_target", 10);
+        
+        current_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+            "/current_ee_pose", 10);
+            
         gripper_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64>(
             "/gripper_command", 10);
         
-        // Wait for XR topics to be available
+        // Wait for topics
         waitForTopics();
         
         // Create timer
         auto period = std::chrono::duration<double>(dt_);
         timer_ = this->create_wall_timer(
             std::chrono::duration_cast<std::chrono::nanoseconds>(period),
-            std::bind(&IKSolverNode::controlLoop, this));
+            std::bind(&CartesianTargetNode::controlLoop, this));
         
-        RCLCPP_INFO(this->get_logger(), "IK Solver Node with TRAC-IK initialized");
-        RCLCPP_INFO(this->get_logger(), "Position tolerance: %.3f mm", ik_pos_tolerance_ * 1000);
-        RCLCPP_INFO(this->get_logger(), "Orientation tolerance: %.3f degrees", ik_ori_tolerance_ * 57.3);
+        RCLCPP_INFO(this->get_logger(), "Cartesian Target Node initialized");
+        RCLCPP_INFO(this->get_logger(), "Scale factor: %.2f", scale_factor_);
+        RCLCPP_INFO(this->get_logger(), "Control frequency: %.1f Hz", control_frequency_);
     }
     
 private:
-    // TRAC-IK solver
-    std::unique_ptr<TRAC_IK::TRAC_IK> tracik_solver_;
+    // FK solver
     std::unique_ptr<KDL::ChainFkSolverPos_recursive> fk_solver_;
     KDL::Chain kdl_chain_;
     
     // Joint state
     KDL::JntArray current_joint_positions_;
-    KDL::JntArray target_joint_positions_;
     std::vector<std::string> joint_names_;
     std::map<std::string, int> joint_name_to_index_;
     int num_joints_;
     bool joints_initialized_ = false;
     
-    // Solution history for fallback
-    std::deque<KDL::JntArray> solution_history_;
-    const size_t history_size_ = 5;
+    // Current end-effector pose
+    KDL::Frame current_ee_frame_;
     
     // XR data storage
     double current_grip_value_ = 0.0;
@@ -131,7 +116,6 @@ private:
     std::string urdf_path_, base_link_, end_effector_link_;
     double scale_factor_;
     double control_frequency_, dt_;
-    double ik_pos_tolerance_, ik_ori_tolerance_, ik_max_time_;
     
     // Control state
     bool is_active_ = false;
@@ -150,12 +134,13 @@ private:
     rclcpp::Subscription<xr_interfaces::msg::KeyValue>::SharedPtr right_trigger_sub_;
     rclcpp::Subscription<xr_interfaces::msg::Pose>::SharedPtr right_controller_pose_sub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
-    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr target_joint_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target_pose_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr current_pose_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gripper_cmd_pub_;
     
     rclcpp::TimerBase::SharedPtr timer_;
     
-    bool initializeTracIK()
+    bool initializeFKSolver()
     {
         // Read URDF file
         std::ifstream urdf_file(urdf_path_);
@@ -167,40 +152,22 @@ private:
         std::string urdf_string((std::istreambuf_iterator<char>(urdf_file)),
                                 std::istreambuf_iterator<char>());
         
-        // Initialize TRAC-IK - 修正参数顺序
-        tracik_solver_ = std::make_unique<TRAC_IK::TRAC_IK>(
-            base_link_,              // base
-            end_effector_link_,      // tip
-            urdf_string,             // URDF xml string
-            ik_max_time_,            // 超时时间（秒）
-            ik_pos_tolerance_,       // eps：收敛阈值（位置+姿态误差范数）
-            TRAC_IK::SolveType::Distance  // 解算类型
-        );
-        
-        // Get chain for FK solver
+        // Parse URDF to KDL tree
         KDL::Tree kdl_tree;
         if (!kdl_parser::treeFromString(urdf_string, kdl_tree)) {
             RCLCPP_ERROR(this->get_logger(), "Failed to parse URDF");
             return false;
         }
         
+        // Extract chain
         if (!kdl_tree.getChain(base_link_, end_effector_link_, kdl_chain_)) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to extract chain");
+            RCLCPP_ERROR(this->get_logger(), "Failed to extract chain from %s to %s", 
+                         base_link_.c_str(), end_effector_link_.c_str());
             return false;
         }
         
-        // Get joint limits and names
-        KDL::JntArray ll, ul;
-        bool valid = tracik_solver_->getKDLLimits(ll, ul);
-        if (!valid) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to get joint limits");
-            return false;
-        }
-        
-        // 使用正确的方法获取关节数量
         num_joints_ = kdl_chain_.getNrOfJoints();
         current_joint_positions_.resize(num_joints_);
-        target_joint_positions_.resize(num_joints_);
         
         // Initialize FK solver
         fk_solver_ = std::make_unique<KDL::ChainFkSolverPos_recursive>(kdl_chain_);
@@ -212,19 +179,18 @@ private:
             if (joint.getType() != KDL::Joint::None) {
                 joint_names_.push_back(joint.getName());
                 joint_name_to_index_[joint.getName()] = joint_names_.size() - 1;
-                RCLCPP_INFO(this->get_logger(), "Joint %zu: %s [%.2f, %.2f]", 
-                           joint_names_.size()-1, joint.getName().c_str(),
-                           ll(joint_names_.size()-1), ul(joint_names_.size()-1));
+                RCLCPP_INFO(this->get_logger(), "Joint %zu: %s", 
+                           joint_names_.size()-1, joint.getName().c_str());
             }
         }
         
-        RCLCPP_INFO(this->get_logger(), "TRAC-IK initialized with %d joints", num_joints_);
+        RCLCPP_INFO(this->get_logger(), "FK solver initialized with %d joints", num_joints_);
         return true;
     }
     
     void initializeTransforms()
     {
-        // R_HEADSET_TO_WORLD
+        // R_HEADSET_TO_WORLD (same as IK node)
         R_headset_world_ << 0, 0, -1,
                            -1, 0, 0,
                            0, 1, 0;
@@ -239,7 +205,6 @@ private:
     {
         RCLCPP_INFO(this->get_logger(), "Waiting for XR topics...");
         
-        // 等待所有XR topic都有发布者
         while (rclcpp::ok()) {
             auto grip_count = this->count_publishers("/xr/right_grip");
             auto trigger_count = this->count_publishers("/xr/right_trigger");
@@ -289,9 +254,13 @@ private:
         
         // Initialize on first callback
         if (!joints_initialized_) {
-            target_joint_positions_ = current_joint_positions_;
             joints_initialized_ = true;
             RCLCPP_INFO(this->get_logger(), "Joints initialized from joint_states");
+        }
+        
+        // Compute current end-effector pose
+        if (joints_initialized_) {
+            fk_solver_->JntToCart(current_joint_positions_, current_ee_frame_);
         }
     }
     
@@ -329,24 +298,26 @@ private:
         delta_rot = R_z_90_cw_ * delta_rot;
     }
     
-    bool solveIKWithConsistency(const KDL::Frame& target_frame, KDL::JntArray& solution)
+    geometry_msgs::msg::PoseStamped kdlFrameToPoseMsg(const KDL::Frame& frame)
     {
-        // 使用当前关节位置作为种子
-        KDL::JntArray seed = current_joint_positions_;
+        geometry_msgs::msg::PoseStamped pose_msg;
+        pose_msg.header.stamp = this->now();
+        pose_msg.header.frame_id = base_link_;
         
-        // 直接求解IK
-        int ret = tracik_solver_->CartToJnt(seed, target_frame, solution);
+        // Position
+        pose_msg.pose.position.x = frame.p.x();
+        pose_msg.pose.position.y = frame.p.y();
+        pose_msg.pose.position.z = frame.p.z();
         
-        if (ret >= 0) {
-            return true;
-        }
+        // Orientation
+        double x, y, z, w;
+        frame.M.GetQuaternion(x, y, z, w);
+        pose_msg.pose.orientation.x = x;
+        pose_msg.pose.orientation.y = y;
+        pose_msg.pose.orientation.z = z;
+        pose_msg.pose.orientation.w = w;
         
-        // 如果失败，尝试用更宽松的容差
-        ret = tracik_solver_->CartToJnt(seed, target_frame, solution,
-                                       KDL::Twist(KDL::Vector(ik_pos_tolerance_*2, ik_pos_tolerance_*2, ik_pos_tolerance_*2),
-                                                 KDL::Vector(ik_ori_tolerance_*3, ik_ori_tolerance_*3, ik_ori_tolerance_*3)));
-        
-        return ret >= 0;
+        return pose_msg;
     }
     
     void controlLoop()
@@ -356,6 +327,10 @@ private:
             return;
         }
         
+        // Publish current end-effector pose
+        auto current_pose_msg = kdlFrameToPoseMsg(current_ee_frame_);
+        current_pose_pub_->publish(current_pose_msg);
+        
         // Check activation state
         bool new_active = (current_grip_value_ > 0.9);
         
@@ -363,15 +338,15 @@ private:
             if (new_active) {
                 RCLCPP_INFO(this->get_logger(), "Control activated");
                 
-                // 重新初始化参考姿态
-                fk_solver_->JntToCart(current_joint_positions_, ref_ee_frame_);
+                // Initialize reference frames
+                ref_ee_frame_ = current_ee_frame_;
                 ref_ee_frame_valid_ = true;
-                ref_controller_valid_ = false;  // 强制重新初始化控制器参考
+                ref_controller_valid_ = false;  // Force reinitialize controller reference
                 
             } else {
                 RCLCPP_INFO(this->get_logger(), "Control deactivated");
                 
-                // 清除参考值
+                // Clear references
                 ref_ee_frame_valid_ = false;
                 ref_controller_valid_ = false;
             }
@@ -379,7 +354,7 @@ private:
             is_active_ = new_active;
         }
         
-        // Process control if active
+        // Calculate and publish target pose if active
         if (is_active_ && current_controller_pose_.size() >= 7) {
             // Calculate deltas
             Eigen::Vector3d delta_pos, delta_rot;
@@ -398,47 +373,15 @@ private:
                     target_frame.M = delta_rotation * target_frame.M;
                 }
                 
-                // Solve IK
-                KDL::JntArray ik_solution(num_joints_);
-                if (solveIKWithConsistency(target_frame, ik_solution)) {
-                    target_joint_positions_ = ik_solution;
-                    
-                    // Store in history
-                    solution_history_.push_back(ik_solution);
-                    if (solution_history_.size() > history_size_) {
-                        solution_history_.pop_front();
-                    }
-                    
-                } else {
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                                       "IK solution not found, using last solution");
-                    
-                    // Use last successful solution if available
-                    if (!solution_history_.empty()) {
-                        target_joint_positions_ = solution_history_.back();
-                    }
-                }
+                // Publish target pose
+                auto target_pose_msg = kdlFrameToPoseMsg(target_frame);
+                target_pose_pub_->publish(target_pose_msg);
             }
         } else if (!is_active_) {
-            // When not active, use last successful solution or current position
-            if (!solution_history_.empty()) {
-                target_joint_positions_ = solution_history_.back();
-            } else {
-                target_joint_positions_ = current_joint_positions_;
-            }
+            // When not active, publish current pose as target
+            auto target_pose_msg = kdlFrameToPoseMsg(current_ee_frame_);
+            target_pose_pub_->publish(target_pose_msg);
         }
-        
-        // Publish target joint positions
-        sensor_msgs::msg::JointState target_msg;
-        target_msg.header.stamp = this->now();
-        target_msg.name = joint_names_;
-        target_msg.position.resize(num_joints_);
-        
-        for (int i = 0; i < num_joints_; ++i) {
-            target_msg.position[i] = target_joint_positions_(i);
-        }
-        
-        target_joint_pub_->publish(target_msg);
         
         // Publish gripper command
         std_msgs::msg::Float64 gripper_msg;
@@ -452,7 +395,7 @@ int main(int argc, char** argv)
     rclcpp::init(argc, argv);
     
     try {
-        auto node = std::make_shared<IKSolverNode>();
+        auto node = std::make_shared<CartesianTargetNode>();
         rclcpp::spin(node);
     } catch (const std::exception& e) {
         RCLCPP_ERROR(rclcpp::get_logger("main"), "Exception: %s", e.what());

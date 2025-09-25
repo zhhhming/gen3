@@ -1,22 +1,25 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>arm_visualizer</name>
+  <name>velocity_control</name>
   <version>0.0.0</version>
-  <description>Arm visualization node for current and target positions</description>
+  <description>Velocity-based Cartesian controller front-end using Twist with controller switching.</description>
   <maintainer email="googoo000078@gmail.com">ming</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
-  <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>controller_manager_msgs</depend>
   <depend>tf2</depend>
-  <depend>tf2_ros</depend>
-  <depend>urdf</depend>
+  <depend>tf2_kdl</depend>
   <depend>kdl_parser</depend>
   <depend>orocos_kdl</depend>
+  <depend>eigen3_cmake_module</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

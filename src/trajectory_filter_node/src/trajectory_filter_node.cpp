@@ -19,8 +19,8 @@ public:
     TrajectoryFilterNode() : Node("trajectory_filter_node")
     {
         // Declare parameters
-        this->declare_parameter("filter_alpha", 0.15);  // 低通滤波系数 (0-1)
-        this->declare_parameter("control_rate", 100.0);  // 控制频率Hz
+        this->declare_parameter("filter_alpha", 0.1);  // 低通滤波系数 (0-1)
+        this->declare_parameter("control_rate", 30.0);  // 控制频率Hz
         this->declare_parameter("filter_deadband", 0.001);  // 死区阈值(弧度)
         this->declare_parameter("trajectory_duration", 0.1);  // 轨迹持续时间(秒)
         
@@ -35,7 +35,7 @@ public:
         // 定义关节名称 (根据你的机器人配置调整)
         joint_names_ = {
             "joint_1", "joint_2", "joint_3", "joint_4", 
-            "joint_5", "joint_6", "joint_7","right_finger_bottom_joint"
+            "joint_5", "joint_6", "joint_7"
         };
         
         num_joints_ = joint_names_.size();
@@ -68,8 +68,8 @@ public:
             "/joint_trajectory_controller/joint_trajectory", 10);
         
         // Wait for initial data
-        waitForInitialData();
-        
+        // waitForInitialData();
+        initialization_start_time_ = this->now();
         // Create control timer
         auto period = std::chrono::duration<double>(dt_);
         control_timer_ = this->create_wall_timer(
@@ -81,6 +81,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "Control rate: %.1f Hz", control_rate_);
         RCLCPP_INFO(this->get_logger(), "Deadband: %.4f rad", filter_deadband_);
         RCLCPP_INFO(this->get_logger(), "Trajectory duration: %.3f sec", trajectory_duration_);
+        RCLCPP_INFO(this->get_logger(), "Waiting for initial data...");
     }
     
 private:
@@ -113,7 +114,8 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr trajectory_pub_;
     rclcpp::TimerBase::SharedPtr control_timer_;
-    
+    rclcpp::Time initialization_start_time_;
+
     void waitForInitialData()
     {
         RCLCPP_INFO(this->get_logger(), "Waiting for initial data...");
@@ -158,14 +160,23 @@ private:
                 target_positions_[it->second] = msg->position[i];
             }
         }
+        if(!target_received_)
+        {
+            target_received_ = true;
+            RCLCPP_INFO(this->get_logger(),"target received!");
+        }
         
-        target_received_ = true;
     }
     
     void gripperCommandCallback(const std_msgs::msg::Float64::SharedPtr msg)
     {
         gripper_command_ = msg->data;
-        gripper_received_ = true;
+        
+        if(!gripper_received_ )
+        {
+            gripper_received_ = true;
+            RCLCPP_INFO(this->get_logger(),"gripper received!");
+        }
     }
     
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
@@ -183,7 +194,13 @@ private:
             }
         }
         
-        joint_states_received_ = true;
+        
+        if(!joint_states_received_)
+        {
+            joint_states_received_ = true;
+            RCLCPP_INFO(this->get_logger(),"joint state received!");
+        }
+        
     }
     
     double normalizeAngleRad(double angle_rad) const
@@ -214,7 +231,7 @@ private:
     
     void applyLowPassFilter()
     {
-        for (size_t i = 0; i < num_joints_-1; ++i) {
+        for (size_t i = 0; i < num_joints_; ++i) {
             // 角度连续性处理：将目标角度调整为最近的等效角度
             double adjusted_target = toNearestEquivalentAngle(target_positions_[i], filtered_positions_[i]);
             
@@ -245,12 +262,12 @@ private:
         
         // 设置位置 (前6个关节 + 夹爪)
         point.positions.resize(num_joints_);
-        for (size_t i = 0; i < num_joints_ - 1; ++i) {  // 前6个关节使用滤波后的位置
+        for (size_t i = 0; i < num_joints_ ; ++i) {  // 前6个关节使用滤波后的位置
             point.positions[i] = filtered_positions_[i];
         }
         
         // 夹爪位置不滤波，直接使用命令值
-        point.positions[num_joints_ - 1] = gripper_command_;
+        // point.positions[num_joints_ - 1] = gripper_command_;
         
         // 设置时间
         point.time_from_start = rclcpp::Duration::from_seconds(trajectory_duration_);
@@ -266,8 +283,33 @@ private:
     void controlLoop()
     {
         if (!initialized_) {
-            RCLCPP_DEBUG(this->get_logger(), "Waiting for initialization...");
-            return;
+            // 检查是否收到必要数据
+            if (target_received_ && joint_states_received_) {
+                // 如果gripper数据5秒内没来，使用默认值
+                auto elapsed = (this->now() - initialization_start_time_).seconds();
+                if (!gripper_received_ && elapsed > 5.0) {
+                    RCLCPP_WARN(this->get_logger(), "Using default gripper value 0.0");
+                    gripper_command_ = 0.0;
+                    gripper_received_ = true;
+                }
+                
+                if (gripper_received_) {
+                    // 初始化完成
+                    filtered_positions_ = current_positions_;
+                    initialized_ = true;
+                    RCLCPP_INFO(this->get_logger(), "✅ Filter initialized!");
+                }
+            }
+            
+            // 定期打印等待状态
+            static auto last_log = this->now();
+            if ((this->now() - last_log).seconds() > 2.0) {
+                RCLCPP_INFO(this->get_logger(), "Waiting... target=%d, joints=%d, gripper=%d",
+                        target_received_, joint_states_received_, gripper_received_);
+                last_log = this->now();
+            }
+            
+            return; // 还没初始化完成，不执行控制
         }
         
         // 应用低通滤波
