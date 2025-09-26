@@ -54,14 +54,15 @@ public:
         // 改进的滤波参数
         this->declare_parameter("target_filter_alpha", 0.95);      // 目标极轻滤波（快速响应）
         this->declare_parameter("current_filter_alpha", 0.95);      // 当前位姿轻滤波（减少测量噪音）
-        this->declare_parameter("error_filter_alpha", 0.8);        // 误差滤波（用于比例项）
-        this->declare_parameter("derivative_filter_alpha", 0.3);   // 微分项滤波（更强滤波）
+        this->declare_parameter("error_filter_alpha", 0.8);        // 误差滤波（用于比例项和微分项）
         this->declare_parameter("velocity_filter_alpha", 0.7);     // 速度输出滤波（可以更轻）
         
-        // 死区参数
-        this->declare_parameter("deadzone", 0.002);               // 2mm位置死区
-        this->declare_parameter("angular_deadzone", 0.015);       // ~0.57度姿态死区
+        // 速度死区参数（只保留速度死区）
         this->declare_parameter("velocity_deadzone", 0.003);      // 速度死区
+        
+        // 微分项尖峰检测参数
+        this->declare_parameter("error_near_zero_threshold", 0.005);  // 误差接近0的阈值
+        this->declare_parameter("spike_detection_factor", 5.0);       // 尖峰检测因子
         
         this->declare_parameter("publish_angular_in_degrees", true);
         this->declare_parameter("log_enabled", true);
@@ -95,13 +96,14 @@ public:
         target_filter_alpha_ = this->get_parameter("target_filter_alpha").as_double();
         current_filter_alpha_ = this->get_parameter("current_filter_alpha").as_double();
         error_filter_alpha_ = this->get_parameter("error_filter_alpha").as_double();
-        derivative_filter_alpha_ = this->get_parameter("derivative_filter_alpha").as_double();
         filter_alpha_ = this->get_parameter("velocity_filter_alpha").as_double();
         
-        // 死区
-        position_deadzone_ = this->get_parameter("deadzone").as_double();
-        angular_deadzone_ = this->get_parameter("angular_deadzone").as_double();
+        // 速度死区
         velocity_deadzone_ = this->get_parameter("velocity_deadzone").as_double();
+        
+        // 微分项尖峰检测参数
+        error_near_zero_threshold_ = this->get_parameter("error_near_zero_threshold").as_double();
+        spike_detection_factor_ = this->get_parameter("spike_detection_factor").as_double();
         
         publish_ang_in_degrees_ = this->get_parameter("publish_angular_in_degrees").as_bool();
         log_enabled_ = this->get_parameter("log_enabled").as_bool();
@@ -133,10 +135,8 @@ public:
         filtered_orientation_error_.setZero();
         
         // 初始化PD控制相关变量
-        last_position_error_.setZero();
-        last_orientation_error_.setZero();
-        filtered_position_derivative_.setZero();
-        filtered_orientation_derivative_.setZero();
+        last_filtered_position_error_.setZero();
+        last_filtered_orientation_error_.setZero();
         first_control_cycle_ = true;
         target_initialized_ = false;
         current_initialized_ = false;
@@ -243,9 +243,8 @@ public:
             }
         }
         RCLCPP_INFO(this->get_logger(), "PD Velocity Control Node initialized with improved filtering");
-        RCLCPP_INFO(this->get_logger(), "Filter alphas - Target: %.2f, Current: %.2f, Error: %.2f, Derivative: %.2f, Velocity: %.2f",
-                   target_filter_alpha_, current_filter_alpha_, error_filter_alpha_, 
-                   derivative_filter_alpha_, filter_alpha_);
+        RCLCPP_INFO(this->get_logger(), "Filter alphas - Target: %.2f, Current: %.2f, Error: %.2f, Velocity: %.2f",
+                   target_filter_alpha_, current_filter_alpha_, error_filter_alpha_, filter_alpha_);
         RCLCPP_INFO(this->get_logger(), "Position: Kp=%.2f, Kd=%.2f | Orientation: Kp=%.2f, Kd=%.2f", 
                    position_kp_, position_kd_, orientation_kp_, orientation_kd_);
     }
@@ -270,11 +269,9 @@ public:
                 << "err_pos_x,err_pos_y,err_pos_z,"
                 << "err_ori_x,err_ori_y,err_ori_z,"
 
-                // derivatives (raw & filt)
+                // derivatives (raw)
                 << "der_pos_raw_x,der_pos_raw_y,der_pos_raw_z,"
-                << "der_pos_filt_x,der_pos_filt_y,der_pos_filt_z,"
                 << "der_ori_raw_x,der_ori_raw_y,der_ori_raw_z,"
-                << "der_ori_filt_x,der_ori_filt_y,der_ori_filt_z,"
 
                 // PD terms
                 << "lin_p_x,lin_p_y,lin_p_z,"
@@ -294,7 +291,10 @@ public:
 
                 // final command (controller frame; ang may be deg/s)
                 << "cmd_lin_x,cmd_lin_y,cmd_lin_z,"
-                << "cmd_ang_x,cmd_ang_y,cmd_ang_z\n";
+                << "cmd_ang_x,cmd_ang_y,cmd_ang_z,"
+                
+                // spike detection info
+                << "spike_detected,pos_near_zero,ori_near_zero\n";
 
             for (const auto& s : logs_) {
                 ofs << s.t << ","
@@ -309,9 +309,7 @@ public:
 
                     // derivatives
                     << s.pos_err_der_raw.x()  << "," << s.pos_err_der_raw.y()  << "," << s.pos_err_der_raw.z()  << ","
-                    << s.pos_err_der_filt.x() << "," << s.pos_err_der_filt.y() << "," << s.pos_err_der_filt.z() << ","
                     << s.ori_err_der_raw.x()  << "," << s.ori_err_der_raw.y()  << "," << s.ori_err_der_raw.z()  << ","
-                    << s.ori_err_der_filt.x() << "," << s.ori_err_der_filt.y() << "," << s.ori_err_der_filt.z() << ","
 
                     // PD terms
                     << s.lin_p.x() << "," << s.lin_p.y() << "," << s.lin_p.z() << ","
@@ -331,7 +329,10 @@ public:
 
                     // final command (controller frame)
                     << s.lin_cmd_ctrl.x() << "," << s.lin_cmd_ctrl.y() << "," << s.lin_cmd_ctrl.z() << ","
-                    << s.ang_cmd_ctrl_out.x() << "," << s.ang_cmd_ctrl_out.y() << "," << s.ang_cmd_ctrl_out.z()
+                    << s.ang_cmd_ctrl_out.x() << "," << s.ang_cmd_ctrl_out.y() << "," << s.ang_cmd_ctrl_out.z() << ","
+                    
+                    // spike detection
+                    << s.spike_detected << "," << s.pos_near_zero << "," << s.ori_near_zero
                     << "\n";
             }
             ofs.close();
@@ -400,14 +401,16 @@ private:
     
     // 滤波参数
     double filter_alpha_;                  // 速度输出滤波
-    double derivative_filter_alpha_;       // 微分项滤波
     double target_filter_alpha_;          // 目标位姿滤波
     double current_filter_alpha_;         // 当前位姿滤波  
     double error_filter_alpha_;           // 误差滤波
     
-    // 死区
-    double position_deadzone_, angular_deadzone_;
+    // 死区（只保留速度死区）
     double velocity_deadzone_;
+    
+    // 微分项尖峰检测参数
+    double error_near_zero_threshold_;    // 误差接近0的阈值
+    double spike_detection_factor_;       // 尖峰检测因子
     
     // Control states
     geometry_msgs::msg::PoseStamped target_pose_;
@@ -438,11 +441,9 @@ private:
     Eigen::Vector3d filtered_position_error_;
     Eigen::Vector3d filtered_orientation_error_;
     
-    // PD控制相关状态
-    Eigen::Vector3d last_position_error_;
-    Eigen::Vector3d last_orientation_error_;
-    Eigen::Vector3d filtered_position_derivative_;
-    Eigen::Vector3d filtered_orientation_derivative_;
+    // PD控制相关状态（现在使用滤波后的误差）
+    Eigen::Vector3d last_filtered_position_error_;
+    Eigen::Vector3d last_filtered_orientation_error_;
     
     // Gripper state
     double gripper_command_ = 0.0;
@@ -470,9 +471,7 @@ private:
         Eigen::Vector3d pos_err;
         Eigen::Vector3d ori_err;
         Eigen::Vector3d pos_err_der_raw;
-        Eigen::Vector3d pos_err_der_filt;
         Eigen::Vector3d ori_err_der_raw;
-        Eigen::Vector3d ori_err_der_filt;
         Eigen::Vector3d lin_p;
         Eigen::Vector3d lin_d;
         Eigen::Vector3d ang_p;
@@ -487,6 +486,9 @@ private:
         Eigen::Vector3d ang_after_filter;
         Eigen::Vector3d lin_cmd_ctrl;     
         Eigen::Vector3d ang_cmd_ctrl_out; 
+        bool spike_detected;
+        bool pos_near_zero;
+        bool ori_near_zero;
     };
 
     std::vector<LogSample> logs_;
@@ -707,13 +709,18 @@ private:
         return result;
     }
     
-    Eigen::Vector3d limitVector(const Eigen::Vector3d& vec, double max_magnitude)
+    // 修改为按轴独立限制
+    Eigen::Vector3d limitVectorByAxis(const Eigen::Vector3d& vec, double max_value)
     {
-        double magnitude = vec.norm();
-        if (magnitude > max_magnitude && magnitude > 1e-6) {
-            return vec * (max_magnitude / magnitude);
+        Eigen::Vector3d result;
+        for (int i = 0; i < 3; ++i) {
+            if (std::abs(vec[i]) > max_value) {
+                result[i] = (vec[i] > 0) ? max_value : -max_value;
+            } else {
+                result[i] = vec[i];
+            }
         }
-        return vec;
+        return result;
     }
     
     Eigen::Vector3d applyAccelerationLimit(const Eigen::Vector3d& desired_vel,
@@ -723,7 +730,8 @@ private:
         Eigen::Vector3d vel_diff = desired_vel - last_vel;
         double max_change = max_acc * dt_;
         
-        vel_diff = limitVector(vel_diff, max_change);
+        // 按轴独立限制加速度
+        vel_diff = limitVectorByAxis(vel_diff, max_change);
         
         return last_vel + vel_diff;
     }
@@ -733,6 +741,38 @@ private:
         Eigen::Quaterniond q = q_in.normalized();
         Eigen::AngleAxisd aa(q);
         return aa.angle() * aa.axis();
+    }
+    
+    // 检测微分项尖峰
+    bool detectDerivativeSpike(const Eigen::Vector3d& current_pos_err,
+                              const Eigen::Vector3d& current_ori_err,
+                              const Eigen::Vector3d& last_pos_err,
+                              const Eigen::Vector3d& last_ori_err,
+                              const Eigen::Vector3d& last_lin_vel,
+                              const Eigen::Vector3d& last_ang_vel,
+                              bool& pos_near_zero,
+                              bool& ori_near_zero)
+    {
+        // 检查误差是否接近0
+        pos_near_zero = current_pos_err.norm() < error_near_zero_threshold_;
+        ori_near_zero = current_ori_err.norm() < error_near_zero_threshold_;
+        
+        if (!pos_near_zero && !ori_near_zero) {
+            return false; // 误差都不接近0，不需要检测
+        }
+        
+        // 计算误差变化量
+        Eigen::Vector3d pos_err_diff = current_pos_err - last_pos_err;
+        Eigen::Vector3d ori_err_diff = current_ori_err - last_ori_err;
+        
+        // 计算检测阈值
+        double pos_threshold = spike_detection_factor_ * dt_ * last_lin_vel.norm();
+        double ori_threshold = spike_detection_factor_ * dt_ * last_ang_vel.norm();
+        
+        bool pos_spike = pos_near_zero && (pos_err_diff.norm() > pos_threshold);
+        bool ori_spike = ori_near_zero && (ori_err_diff.norm() > ori_threshold);
+        
+        return pos_spike || ori_spike;
     }
     
     void controlLoop()
@@ -775,18 +815,19 @@ private:
                 current_filter_alpha_, raw_current_quaternion);
         }
         
-        // ========== 计算原始误差（用于微分） ==========
+        // ========== 计算原始误差 ==========
         Eigen::Vector3d raw_position_error = filtered_target_position_ - filtered_current_position_;
-        raw_position_error = applyDeadzone(raw_position_error, position_deadzone_);
-        
         Eigen::Vector3d raw_orientation_error = computeOrientationError(
             filtered_current_quaternion_, filtered_target_quaternion_);
-        raw_orientation_error = applyDeadzone(raw_orientation_error, angular_deadzone_);
         
-        // ========== 滤波误差（用于比例项） ==========
+        // 移除位置和角度死区处理
+        
+        // ========== 滤波误差（用于比例项和微分项） ==========
         if (first_control_cycle_) {
             filtered_position_error_ = raw_position_error;
             filtered_orientation_error_ = raw_orientation_error;
+            last_filtered_position_error_ = raw_position_error;
+            last_filtered_orientation_error_ = raw_orientation_error;
         } else {
             filtered_position_error_ = error_filter_alpha_ * raw_position_error + 
                                       (1.0 - error_filter_alpha_) * filtered_position_error_;
@@ -794,37 +835,44 @@ private:
                                          (1.0 - error_filter_alpha_) * filtered_orientation_error_;
         }
         
-        // ========== 计算误差导数（微分项） ==========
+        // ========== 计算微分项（不除以dt，直接用差值） ==========
         Eigen::Vector3d position_derivative_raw, orientation_derivative_raw;
+        bool spike_detected = false, pos_near_zero = false, ori_near_zero = false;
         
         if (first_control_cycle_) {
             position_derivative_raw.setZero();
             orientation_derivative_raw.setZero();
-            filtered_position_derivative_.setZero();
-            filtered_orientation_derivative_.setZero();
             first_control_cycle_ = false;
         } else {
-            // 先计算导数，再滤波（避免噪音放大）
-            position_derivative_raw = (raw_position_error - last_position_error_) / dt_;
-            orientation_derivative_raw = (raw_orientation_error - last_orientation_error_) / dt_;
+            // 检测微分项尖峰
+            spike_detected = detectDerivativeSpike(
+                filtered_position_error_, filtered_orientation_error_,
+                last_filtered_position_error_, last_filtered_orientation_error_,
+                last_linear_vel_, last_angular_vel_,
+                pos_near_zero, ori_near_zero);
             
-            // 对导数进行强滤波
-            filtered_position_derivative_ = derivative_filter_alpha_ * position_derivative_raw + 
-                                           (1.0 - derivative_filter_alpha_) * filtered_position_derivative_;
-            filtered_orientation_derivative_ = derivative_filter_alpha_ * orientation_derivative_raw + 
-                                              (1.0 - derivative_filter_alpha_) * filtered_orientation_derivative_;
+            if (spike_detected) {
+                // 检测到尖峰，将微分项设为0
+                position_derivative_raw.setZero();
+                orientation_derivative_raw.setZero();
+                RCLCPP_DEBUG(this->get_logger(), "Derivative spike detected, setting derivatives to zero");
+            } else {
+                // 正常计算微分项（不除以dt）
+                position_derivative_raw = filtered_position_error_ - last_filtered_position_error_;
+                orientation_derivative_raw = filtered_orientation_error_ - last_filtered_orientation_error_;
+            }
         }
         
-        // 保存当前原始误差供下次使用
-        last_position_error_ = raw_position_error;
-        last_orientation_error_ = raw_orientation_error;
+        // 保存当前滤波后的误差供下次使用
+        last_filtered_position_error_ = filtered_position_error_;
+        last_filtered_orientation_error_ = filtered_orientation_error_;
         
         // ========== PD控制律 ==========
-        // 比例项使用滤波后的误差，微分项使用滤波后的导数
+        // 比例项和微分项都使用滤波后的误差
         Eigen::Vector3d lin_p = position_kp_ * filtered_position_error_;
-        Eigen::Vector3d lin_d = position_kd_ * filtered_position_derivative_;
+        Eigen::Vector3d lin_d = position_kd_ * position_derivative_raw;  // 不除以dt
         Eigen::Vector3d ang_p = orientation_kp_ * filtered_orientation_error_;
-        Eigen::Vector3d ang_d = orientation_kd_ * filtered_orientation_derivative_;
+        Eigen::Vector3d ang_d = orientation_kd_ * orientation_derivative_raw;  // 不除以dt
 
         Eigen::Vector3d desired_linear_vel = lin_p + lin_d;
         Eigen::Vector3d desired_angular_vel = ang_p + ang_d;
@@ -833,21 +881,21 @@ private:
         Eigen::Vector3d lin_des_before_limit = desired_linear_vel;
         Eigen::Vector3d ang_des_before_limit = desired_angular_vel;
         
-        // ========== 应用速度限制 ==========
-        desired_linear_vel = limitVector(desired_linear_vel, max_linear_vel_);
-        desired_angular_vel = limitVector(desired_angular_vel, max_angular_vel_);
+        // ========== 应用速度限制（按轴独立） ==========
+        desired_linear_vel = limitVectorByAxis(desired_linear_vel, max_linear_vel_);
+        desired_angular_vel = limitVectorByAxis(desired_angular_vel, max_angular_vel_);
         
         Eigen::Vector3d lin_after_vel_limit = desired_linear_vel;
         Eigen::Vector3d ang_after_vel_limit = desired_angular_vel;
         
-        // ========== 应用加速度限制 ==========
+        // ========== 应用加速度限制（按轴独立） ==========
         desired_linear_vel = applyAccelerationLimit(desired_linear_vel, last_linear_vel_, max_linear_acc_);
         desired_angular_vel = applyAccelerationLimit(desired_angular_vel, last_angular_vel_, max_angular_acc_);
         
         Eigen::Vector3d lin_after_acc_limit = desired_linear_vel;
         Eigen::Vector3d ang_after_acc_limit = desired_angular_vel;
         
-        // ========== 应用输出滤波（现在可以更轻） ==========
+        // ========== 应用输出滤波 ==========
         filtered_linear_vel_ = filter_alpha_ * desired_linear_vel + 
                               (1.0 - filter_alpha_) * filtered_linear_vel_;
         filtered_angular_vel_ = filter_alpha_ * desired_angular_vel + 
@@ -856,7 +904,7 @@ private:
         Eigen::Vector3d lin_after_filter = filtered_linear_vel_;
         Eigen::Vector3d ang_after_filter = filtered_angular_vel_;
         
-        // 应用速度死区
+        // 应用速度死区（只对最终输出速度）
         filtered_linear_vel_ = applyDeadzone(filtered_linear_vel_, velocity_deadzone_);
         filtered_angular_vel_ = applyDeadzone(filtered_angular_vel_, velocity_deadzone_);
         
@@ -897,13 +945,11 @@ private:
             s.quat = filtered_current_quaternion_;
             s.axis_angle_vec = quatToAxisAngleVec(s.quat);
 
-            s.pos_err = raw_position_error;           // 使用原始误差记录
-            s.ori_err = raw_orientation_error;
+            s.pos_err = filtered_position_error_;     // 使用滤波后的误差记录
+            s.ori_err = filtered_orientation_error_;
 
             s.pos_err_der_raw  = position_derivative_raw;
-            s.pos_err_der_filt = filtered_position_derivative_;
             s.ori_err_der_raw  = orientation_derivative_raw;
-            s.ori_err_der_filt = filtered_orientation_derivative_;
 
             s.lin_p = lin_p;
             s.lin_d = lin_d;
@@ -921,6 +967,10 @@ private:
 
             s.lin_cmd_ctrl     = lin_ctrl;
             s.ang_cmd_ctrl_out = ang_ctrl_out;
+            
+            s.spike_detected = spike_detected;
+            s.pos_near_zero = pos_near_zero;
+            s.ori_near_zero = ori_near_zero;
 
             logs_.push_back(std::move(s));
         }
@@ -928,15 +978,19 @@ private:
         // ========== 调试输出 ==========
         static int counter = 0;
         if (++counter % static_cast<int>(control_frequency_) == 0) {
+            if (spike_detected) {
+                RCLCPP_WARN(this->get_logger(), "Derivative spike detected and suppressed");
+            }
+            
             RCLCPP_INFO(this->get_logger(), 
                        "Filtered Err | Pos: [%.3f, %.3f, %.3f]m | Orient: [%.3f, %.3f, %.3f]rad",
                        filtered_position_error_.x(), filtered_position_error_.y(), filtered_position_error_.z(),
                        filtered_orientation_error_.x(), filtered_orientation_error_.y(), filtered_orientation_error_.z());
             
             RCLCPP_INFO(this->get_logger(), 
-                       "Derivatives | Pos: [%.3f, %.3f, %.3f]m/s | Orient: [%.3f, %.3f, %.3f]rad/s",
-                       filtered_position_derivative_.x(), filtered_position_derivative_.y(), filtered_position_derivative_.z(),
-                       filtered_orientation_derivative_.x(), filtered_orientation_derivative_.y(), filtered_orientation_derivative_.z());
+                       "Derivatives | Pos: [%.3f, %.3f, %.3f] | Orient: [%.3f, %.3f, %.3f] (no dt division)",
+                       position_derivative_raw.x(), position_derivative_raw.y(), position_derivative_raw.z(),
+                       orientation_derivative_raw.x(), orientation_derivative_raw.y(), orientation_derivative_raw.z());
             
             RCLCPP_INFO(this->get_logger(),
                        "Output vel | Linear: [%.3f, %.3f, %.3f]m/s | Angular: [%.3f, %.3f, %.3f]%s",
