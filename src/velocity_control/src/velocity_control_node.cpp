@@ -16,6 +16,9 @@
 #include <deque>
 #include <cmath>
 #include <fstream>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 using namespace std::chrono_literals;
 using GripperCommand = control_msgs::action::GripperCommand;
@@ -34,14 +37,16 @@ public:
         
         // Velocity control parameters
         this->declare_parameter("position_gain", 2.0);  // P gain for position error
-        this->declare_parameter("orientation_gain", 1.0);  // P gain for orientation error
+        this->declare_parameter("orientation_gain", 2.0);  // P gain for orientation error
         this->declare_parameter("max_linear_velocity", 0.5);  // m/s
         this->declare_parameter("max_angular_velocity", 1.0);  // rad/s
-        this->declare_parameter("max_linear_acceleration", 1.0);  // m/s^2
-        this->declare_parameter("max_angular_acceleration", 2.0);  // rad/s^2
-        this->declare_parameter("velocity_filter_alpha", 0.3);  // Low-pass filter coefficient
+        this->declare_parameter("max_linear_acceleration", 10.0);  // m/s^2
+        this->declare_parameter("max_angular_acceleration", 5.0);  // rad/s^2
+        this->declare_parameter("velocity_filter_alpha", 0.5);  // Low-pass filter coefficient
         this->declare_parameter("deadzone", 0.002);  // 2mm deadzone for position
         this->declare_parameter("angular_deadzone", 0.01);  // ~0.57 degrees deadzone for orientation
+        this->declare_parameter("publish_angular_in_degrees", true);
+
         
         // Get parameters
         urdf_path_ = this->get_parameter("robot_urdf_path").as_string();
@@ -59,7 +64,11 @@ public:
         filter_alpha_ = this->get_parameter("velocity_filter_alpha").as_double();
         position_deadzone_ = this->get_parameter("deadzone").as_double();
         angular_deadzone_ = this->get_parameter("angular_deadzone").as_double();
-        
+        publish_ang_in_degrees_ = this->get_parameter("publish_angular_in_degrees").as_bool();
+
+        R_ctrl_from_rviz_ << 0, 1, 0,
+                             0, 0, 1,
+                             1, 0, 0;
         dt_ = 1.0 / control_frequency_;
         
         // Initialize FK solver
@@ -205,13 +214,14 @@ private:
     geometry_msgs::msg::PoseStamped target_pose_;
     bool target_received_ = false;
     bool joints_initialized_ = false;
-    
+    bool publish_ang_in_degrees_ = true;
+
     // Velocity states
     Eigen::Vector3d filtered_linear_vel_;
     Eigen::Vector3d filtered_angular_vel_;
     Eigen::Vector3d last_linear_vel_;
     Eigen::Vector3d last_angular_vel_;
-    
+    Eigen::Matrix3d R_ctrl_from_rviz_;
     // Gripper state
     double gripper_command_ = 0.0;
     double last_gripper_command_ = -1.0;  // Initialize to invalid value to force first send
@@ -428,6 +438,13 @@ private:
         
         return last_vel + vel_diff;
     }
+
+
+    static inline Eigen::Vector3d remap_rviz_to_controller(const Eigen::Vector3d& v_rviz)
+    {
+        // RViz/base_link: [x, y, z]  ->  Controller: [y, z, x]
+        return Eigen::Vector3d(v_rviz.y(), v_rviz.z(), v_rviz.x());
+    }
     
     void controlLoop()
     {
@@ -487,18 +504,39 @@ private:
         filtered_angular_vel_ = filter_alpha_ * desired_angular_vel + 
                                (1.0 - filter_alpha_) * filtered_angular_vel_;
         
+                // 低通滤波后的速度（仍在 RViz/base_link 轴向）
+        Eigen::Vector3d lin_rviz = filtered_linear_vel_;
+        Eigen::Vector3d ang_rviz = filtered_angular_vel_;
+
+        // 用 3x3 置换矩阵映射到控制器坐标
+        Eigen::Vector3d lin_ctrl = R_ctrl_from_rviz_ * lin_rviz;
+        Eigen::Vector3d ang_ctrl = R_ctrl_from_rviz_ * ang_rviz;
+
+        Eigen::Vector3d ang_ctrl_out = ang_ctrl;  // 默认按 rad/s
+        if (publish_ang_in_degrees_) {
+            constexpr double RAD2DEG = 180.0 / M_PI;
+            ang_ctrl_out *= RAD2DEG;  // 转成 deg/s
+        }
+
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "CTRL Linear vel: [%.3f, %.3f, %.3f] m/s, Angular vel: [%.3f, %.3f, %.3f] %s",
+            lin_ctrl.x(), lin_ctrl.y(), lin_ctrl.z(),
+            ang_ctrl_out.x(), ang_ctrl_out.y(), ang_ctrl_out.z(),
+            publish_ang_in_degrees_ ? "deg/s" : "rad/s");
+
         // Update last velocities
+        
         last_linear_vel_ = filtered_linear_vel_;
         last_angular_vel_ = filtered_angular_vel_;
         
         // Publish twist command
         geometry_msgs::msg::Twist twist_msg;
-        twist_msg.linear.x = filtered_linear_vel_.x();
-        twist_msg.linear.y = filtered_linear_vel_.y();
-        twist_msg.linear.z = filtered_linear_vel_.z();
-        twist_msg.angular.x = filtered_angular_vel_.x();
-        twist_msg.angular.y = filtered_angular_vel_.y();
-        twist_msg.angular.z = filtered_angular_vel_.z();
+        twist_msg.linear.x  = lin_ctrl.x();
+        twist_msg.linear.y  = lin_ctrl.y();
+        twist_msg.linear.z  = lin_ctrl.z();
+        twist_msg.angular.x = ang_ctrl_out.x();
+        twist_msg.angular.y = ang_ctrl_out.y();
+        twist_msg.angular.z = ang_ctrl_out.z();
         
         twist_pub_->publish(twist_msg);
         

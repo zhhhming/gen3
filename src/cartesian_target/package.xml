@@ -16,6 +16,7 @@
   <depend>kdl_parser</depend>
   <depend>orocos_kdl</depend>
   <depend>tf2</depend>
+  <depend>tf2_ros</depend>
   <depend>xr_interfaces</depend>
   <depend>eigen3_cmake_module</depend>
 

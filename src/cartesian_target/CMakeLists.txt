@@ -14,6 +14,7 @@ find_package(std_msgs REQUIRED)
 find_package(kdl_parser REQUIRED)
 find_package(orocos_kdl REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(xr_interfaces REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
@@ -29,8 +30,15 @@ target_include_directories(cartesian_target_node PRIVATE
 
 # 依赖（会自动加 include 和链接）
 ament_target_dependencies(cartesian_target_node
-  rclcpp geometry_msgs sensor_msgs std_msgs
-  kdl_parser orocos_kdl tf2 xr_interfaces
+  rclcpp
+  geometry_msgs 
+  sensor_msgs 
+  std_msgs
+  kdl_parser 
+  orocos_kdl 
+  tf2 
+  tf2_ros
+  xr_interfaces
 )
 
 # 显式链接 Eigen3（有些环境需要）

@@ -5,6 +5,8 @@
 #include <std_msgs/msg/float64.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <kdl_parser/kdl_parser.hpp>
 #include <kdl/chainfksolverpos_recursive.hpp>
 #include <fstream>
@@ -48,6 +50,9 @@ public:
         
         // Initialize transforms
         initializeTransforms();
+        
+        // Initialize TF broadcaster
+        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
         
         // Create subscribers for XR data
         right_grip_sub_ = this->create_subscription<xr_interfaces::msg::KeyValue>(
@@ -103,6 +108,10 @@ private:
     // Current end-effector pose
     KDL::Frame current_ee_frame_;
     
+    // History target frame (for maintaining last target when not active)
+    KDL::Frame history_target_frame_;
+    bool history_initialized_ = false;
+    
     // XR data storage
     double current_grip_value_ = 0.0;
     double current_trigger_value_ = 0.0;
@@ -125,6 +134,9 @@ private:
     // Transform matrices
     Eigen::Matrix3d R_headset_world_;
     Eigen::Matrix3d R_z_90_cw_;
+    
+    // TF broadcaster
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     
     // ROS interfaces
     rclcpp::Subscription<xr_interfaces::msg::KeyValue>::SharedPtr right_grip_sub_;
@@ -257,6 +269,13 @@ private:
         // Compute current end-effector pose
         if (joints_initialized_) {
             fk_solver_->JntToCart(current_joint_positions_, current_ee_frame_);
+            
+            // Initialize history with current frame if not yet initialized
+            if (!history_initialized_) {
+                history_target_frame_ = current_ee_frame_;
+                history_initialized_ = true;
+                RCLCPP_INFO(this->get_logger(), "History target frame initialized with current EE pose");
+            }
         }
     }
     
@@ -316,6 +335,46 @@ private:
         return pose_msg;
     }
     
+    geometry_msgs::msg::TransformStamped kdlFrameToTransformMsg(const KDL::Frame& frame, 
+                                                                const std::string& child_frame_id)
+    {
+        geometry_msgs::msg::TransformStamped transform_msg;
+        transform_msg.header.stamp = this->now();
+        transform_msg.header.frame_id = base_link_;
+        transform_msg.child_frame_id = child_frame_id;
+        
+        // Position
+        transform_msg.transform.translation.x = frame.p.x();
+        transform_msg.transform.translation.y = frame.p.y();
+        transform_msg.transform.translation.z = frame.p.z();
+        
+        // Orientation
+        double x, y, z, w;
+        frame.M.GetQuaternion(x, y, z, w);
+        transform_msg.transform.rotation.x = x;
+        transform_msg.transform.rotation.y = y;
+        transform_msg.transform.rotation.z = z;
+        transform_msg.transform.rotation.w = w;
+        
+        return transform_msg;
+    }
+    
+    void publishVisualizationFrames()
+    {
+        if (!joints_initialized_) {
+            return;
+        }
+        
+        // Always publish current EE frame
+        auto current_transform = kdlFrameToTransformMsg(current_ee_frame_, "current_ee_frame");
+        tf_broadcaster_->sendTransform(current_transform);
+        
+        // Publish target frame (use history when not active)
+        KDL::Frame frame_to_publish = is_active_ ? history_target_frame_ : history_target_frame_;
+        auto target_transform = kdlFrameToTransformMsg(frame_to_publish, "target_ee_frame");
+        tf_broadcaster_->sendTransform(target_transform);
+    }
+    
     void controlLoop()
     {
         if (!joints_initialized_ || !xr_data_received_) {
@@ -346,7 +405,9 @@ private:
             is_active_ = new_active;
         }
         
-        // Calculate and publish target pose if active
+        // Calculate and publish target pose
+        KDL::Frame target_frame_to_publish;
+        
         if (is_active_ && current_controller_pose_.size() >= 7) {
             // Calculate deltas
             Eigen::Vector3d delta_pos, delta_rot;
@@ -365,20 +426,31 @@ private:
                     target_frame.M = delta_rotation * target_frame.M;
                 }
                 
-                // Publish target pose
-                auto target_pose_msg = kdlFrameToPoseMsg(target_frame);
-                target_pose_pub_->publish(target_pose_msg);
+                // Update history with new target
+                history_target_frame_ = target_frame;
+                target_frame_to_publish = target_frame;
+            } else {
+                // Use history if reference is not valid
+                target_frame_to_publish = history_target_frame_;
             }
-        } else if (!is_active_) {
-            // When not active, publish current pose as target
-            auto target_pose_msg = kdlFrameToPoseMsg(current_ee_frame_);
-            target_pose_pub_->publish(target_pose_msg);
+        } else {
+            // When not active, use history target frame
+            target_frame_to_publish = history_target_frame_;
         }
         
-        // Publish gripper command
+        // Publish target pose
+        auto target_pose_msg = kdlFrameToPoseMsg(target_frame_to_publish);
+        target_pose_pub_->publish(target_pose_msg);
+        
+        // Publish gripper command (map from 0-1 to 0-100)
         std_msgs::msg::Float64 gripper_msg;
-        gripper_msg.data = current_trigger_value_;
+        double normalized = std::clamp(current_trigger_value_, 0.0, 1.0);
+        double mapped_trigger_value = 0.1 + (0.8 - 0.1) * normalized;
+        gripper_msg.data = mapped_trigger_value;
         gripper_cmd_pub_->publish(gripper_msg);
+        
+        // Publish visualization frames
+        publishVisualizationFrames();
     }
 };
 
@@ -396,3 +468,4 @@ int main(int argc, char** argv)
     rclcpp::shutdown();
     return 0;
 }
+// 速度x正 为rviz y正，速度y正 为rviz z正，速度z正 为rviz x正
