@@ -31,23 +31,33 @@ public:
         // Declare parameters
         this->declare_parameter("robot_urdf_path", "/home/ming/xrrobotics_new/XRoboToolkit-Teleop-Sample-Python/assets/arx/Gen/GEN3-7DOF.urdf");
         this->declare_parameter("control_frequency", 100.0);
-        this->declare_parameter("gripper_control_frequency", 10.0);  // Lower frequency for gripper
+        this->declare_parameter("gripper_control_frequency", 10.0);
         this->declare_parameter("base_link", "base_link");
         this->declare_parameter("end_effector_link", "bracelet_link");
         
-        // Velocity control parameters
-        this->declare_parameter("position_gain", 2.0);  // P gain for position error
-        this->declare_parameter("orientation_gain", 2.0);  // P gain for orientation error
-        this->declare_parameter("max_linear_velocity", 0.5);  // m/s
-        this->declare_parameter("max_angular_velocity", 1.0);  // rad/s
-        this->declare_parameter("max_linear_acceleration", 10.0);  // m/s^2
-        this->declare_parameter("max_angular_acceleration", 5.0);  // rad/s^2
-        this->declare_parameter("velocity_filter_alpha", 0.5);  // Low-pass filter coefficient
-        this->declare_parameter("deadzone", 0.002);  // 2mm deadzone for position
-        this->declare_parameter("angular_deadzone", 0.01);  // ~0.57 degrees deadzone for orientation
+        // PD控制参数
+        this->declare_parameter("position_kp", 3.0);      // 位置比例增益（稍微提高）
+        this->declare_parameter("position_kd", 0.5);      // 位置微分增益（新增）
+        this->declare_parameter("orientation_kp", 3.0);   // 姿态比例增益（稍微提高）
+        this->declare_parameter("orientation_kd", 0.3);   // 姿态微分增益（新增）
+        
+        // 速度和加速度限制（调整）
+        this->declare_parameter("max_linear_velocity", 0.3);      // 降低最大线速度以提高稳定性
+        this->declare_parameter("max_angular_velocity", 0.8);     // 降低最大角速度
+        this->declare_parameter("max_linear_acceleration", 2.0);  // 降低加速度限制以更平滑
+        this->declare_parameter("max_angular_acceleration", 2.0); // 降低角加速度
+        
+        // 滤波参数
+        this->declare_parameter("velocity_filter_alpha", 0.3);    // 降低滤波系数以更平滑
+        this->declare_parameter("derivative_filter_alpha", 0.2);  // 微分项滤波（新增）
+        
+        // 死区参数
+        this->declare_parameter("deadzone", 0.002);               // 2mm位置死区
+        this->declare_parameter("angular_deadzone", 0.01);        // ~0.57度姿态死区
+        this->declare_parameter("velocity_deadzone", 0.001);      // 速度死区（新增）
+        
         this->declare_parameter("publish_angular_in_degrees", true);
 
-        
         // Get parameters
         urdf_path_ = this->get_parameter("robot_urdf_path").as_string();
         control_frequency_ = this->get_parameter("control_frequency").as_double();
@@ -55,15 +65,27 @@ public:
         base_link_ = this->get_parameter("base_link").as_string();
         end_effector_link_ = this->get_parameter("end_effector_link").as_string();
         
-        position_gain_ = this->get_parameter("position_gain").as_double();
-        orientation_gain_ = this->get_parameter("orientation_gain").as_double();
+        // PD控制增益
+        position_kp_ = this->get_parameter("position_kp").as_double();
+        position_kd_ = this->get_parameter("position_kd").as_double();
+        orientation_kp_ = this->get_parameter("orientation_kp").as_double();
+        orientation_kd_ = this->get_parameter("orientation_kd").as_double();
+        
+        // 速度和加速度限制
         max_linear_vel_ = this->get_parameter("max_linear_velocity").as_double();
         max_angular_vel_ = this->get_parameter("max_angular_velocity").as_double();
         max_linear_acc_ = this->get_parameter("max_linear_acceleration").as_double();
         max_angular_acc_ = this->get_parameter("max_angular_acceleration").as_double();
+        
+        // 滤波参数
         filter_alpha_ = this->get_parameter("velocity_filter_alpha").as_double();
+        derivative_filter_alpha_ = this->get_parameter("derivative_filter_alpha").as_double();
+        
+        // 死区
         position_deadzone_ = this->get_parameter("deadzone").as_double();
         angular_deadzone_ = this->get_parameter("angular_deadzone").as_double();
+        velocity_deadzone_ = this->get_parameter("velocity_deadzone").as_double();
+        
         publish_ang_in_degrees_ = this->get_parameter("publish_angular_in_degrees").as_bool();
 
         R_ctrl_from_rviz_ << 0, 1, 0,
@@ -77,11 +99,18 @@ public:
             throw std::runtime_error("FK solver initialization failed");
         }
         
-        // Initialize velocity states
+        // 初始化控制状态
         filtered_linear_vel_.setZero();
         filtered_angular_vel_.setZero();
         last_linear_vel_.setZero();
         last_angular_vel_.setZero();
+        
+        // 初始化PD控制相关变量
+        last_position_error_.setZero();
+        last_orientation_error_.setZero();
+        filtered_position_derivative_.setZero();
+        filtered_orientation_derivative_.setZero();
+        first_control_cycle_ = true;
         
         // Create subscribers
         target_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -113,15 +142,15 @@ public:
             RCLCPP_INFO(this->get_logger(), "Gripper action server is available");
         }
         
-                // 配置 action 回调（非阻塞）
+        // 配置 action 回调（非阻塞）
         send_goal_options_.goal_response_callback =
         [this](rclcpp_action::ClientGoalHandle<GripperCommand>::SharedPtr handle)
         {
             if (!handle) {
-            RCLCPP_WARN(this->get_logger(), "Gripper goal rejected");
+                RCLCPP_WARN(this->get_logger(), "Gripper goal rejected");
             } else {
-            this->current_gripper_goal_ = handle;  // 存句柄，后续可取消
-            RCLCPP_DEBUG(this->get_logger(), "Gripper goal accepted");
+                this->current_gripper_goal_ = handle;
+                RCLCPP_DEBUG(this->get_logger(), "Gripper goal accepted");
             }
         };
 
@@ -130,17 +159,15 @@ public:
                 const std::shared_ptr<const GripperCommand::Feedback> feedback)
         {
             // 可选：打印/使用反馈
-            // RCLCPP_DEBUG(this->get_logger(), "Gripper pos=%.3f, effort=%.3f",
-            //              feedback->position, feedback->effort);
         };
 
         send_goal_options_.result_callback =
         [this](const rclcpp_action::ClientGoalHandle<GripperCommand>::WrappedResult &result)
         {
             if (result.code != rclcpp_action::ResultCode::SUCCEEDED) {
-            RCLCPP_WARN(this->get_logger(), "Gripper goal finished with code %d", (int)result.code);
+                RCLCPP_WARN(this->get_logger(), "Gripper goal finished with code %d", (int)result.code);
             } else {
-            RCLCPP_DEBUG(this->get_logger(), "Gripper goal succeeded");
+                RCLCPP_DEBUG(this->get_logger(), "Gripper goal succeeded");
             }
         };
 
@@ -176,11 +203,13 @@ public:
             std::chrono::duration_cast<std::chrono::nanoseconds>(gripper_period),
             std::bind(&VelocityControlNode::gripperControlLoop, this));
         
-        RCLCPP_INFO(this->get_logger(), "Velocity Control Node initialized");
-        RCLCPP_INFO(this->get_logger(), "Position gain: %.2f, Orientation gain: %.2f", 
-                   position_gain_, orientation_gain_);
+        RCLCPP_INFO(this->get_logger(), "PD Velocity Control Node initialized");
+        RCLCPP_INFO(this->get_logger(), "Position: Kp=%.2f, Kd=%.2f | Orientation: Kp=%.2f, Kd=%.2f", 
+                   position_kp_, position_kd_, orientation_kp_, orientation_kd_);
         RCLCPP_INFO(this->get_logger(), "Max linear vel: %.2f m/s, Max angular vel: %.2f rad/s", 
                    max_linear_vel_, max_angular_vel_);
+        RCLCPP_INFO(this->get_logger(), "Max linear acc: %.2f m/s², Max angular acc: %.2f rad/s²", 
+                   max_linear_acc_, max_angular_acc_);
         RCLCPP_INFO(this->get_logger(), "Control frequency: %.1f Hz, Gripper frequency: %.1f Hz", 
                    control_frequency_, gripper_control_frequency_);
     }
@@ -204,27 +233,46 @@ private:
     // Parameters
     std::string urdf_path_, base_link_, end_effector_link_;
     double control_frequency_, gripper_control_frequency_, dt_;
-    double position_gain_, orientation_gain_;
+    
+    // PD控制增益
+    double position_kp_, position_kd_;
+    double orientation_kp_, orientation_kd_;
+    
+    // 速度和加速度限制
     double max_linear_vel_, max_angular_vel_;
     double max_linear_acc_, max_angular_acc_;
+    
+    // 滤波参数
     double filter_alpha_;
+    double derivative_filter_alpha_;
+    
+    // 死区
     double position_deadzone_, angular_deadzone_;
+    double velocity_deadzone_;
     
     // Control states
     geometry_msgs::msg::PoseStamped target_pose_;
     bool target_received_ = false;
     bool joints_initialized_ = false;
     bool publish_ang_in_degrees_ = true;
+    bool first_control_cycle_ = true;
 
-    // Velocity states
+    // 速度状态
     Eigen::Vector3d filtered_linear_vel_;
     Eigen::Vector3d filtered_angular_vel_;
     Eigen::Vector3d last_linear_vel_;
     Eigen::Vector3d last_angular_vel_;
     Eigen::Matrix3d R_ctrl_from_rviz_;
+    
+    // PD控制相关状态
+    Eigen::Vector3d last_position_error_;
+    Eigen::Vector3d last_orientation_error_;
+    Eigen::Vector3d filtered_position_derivative_;
+    Eigen::Vector3d filtered_orientation_derivative_;
+    
     // Gripper state
     double gripper_command_ = 0.0;
-    double last_gripper_command_ = -1.0;  // Initialize to invalid value to force first send
+    double last_gripper_command_ = -1.0;
     rclcpp_action::Client<GripperCommand>::SendGoalOptions send_goal_options_;
     rclcpp_action::Client<GripperCommand>::GoalHandle::SharedPtr current_gripper_goal_;
     
@@ -295,7 +343,6 @@ private:
         
         auto future = controller_switch_client_->async_send_request(request);
         
-        // Wait for the result
         if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), future) ==
             rclcpp::FutureReturnCode::SUCCESS)
         {
@@ -411,7 +458,9 @@ private:
             if (std::abs(value[i]) < deadzone) {
                 result[i] = 0.0;
             } else {
-                result[i] = value[i];
+                // 可选：从死区边缘开始计算（避免突变）
+                double sign = (value[i] > 0) ? 1.0 : -1.0;
+                result[i] = sign * (std::abs(value[i]) - deadzone);
             }
         }
         return result;
@@ -439,13 +488,6 @@ private:
         return last_vel + vel_diff;
     }
 
-
-    static inline Eigen::Vector3d remap_rviz_to_controller(const Eigen::Vector3d& v_rviz)
-    {
-        // RViz/base_link: [x, y, z]  ->  Controller: [y, z, x]
-        return Eigen::Vector3d(v_rviz.y(), v_rviz.z(), v_rviz.x());
-    }
-    
     void controlLoop()
     {
         if (!target_received_ || !joints_initialized_) {
@@ -457,7 +499,7 @@ private:
         // Get current pose from FK
         auto current_pose = kdlFrameToPoseMsg(current_ee_frame_);
         
-        // Compute position error
+        // ========== 计算位置误差 ==========
         Eigen::Vector3d position_error;
         position_error << target_pose_.pose.position.x - current_pose.pose.position.x,
                          target_pose_.pose.position.y - current_pose.pose.position.y,
@@ -466,7 +508,7 @@ private:
         // Apply deadzone to position error
         position_error = applyDeadzone(position_error, position_deadzone_);
         
-        // Compute orientation error
+        // ========== 计算姿态误差 ==========
         Eigen::Quaterniond current_quat(
             current_pose.pose.orientation.w,
             current_pose.pose.orientation.x,
@@ -482,54 +524,79 @@ private:
         );
         
         Eigen::Vector3d orientation_error = computeOrientationError(current_quat, target_quat);
-        
-        // Apply deadzone to orientation error
         orientation_error = applyDeadzone(orientation_error, angular_deadzone_);
         
-        // Compute desired velocities (proportional control)
-        Eigen::Vector3d desired_linear_vel = position_gain_ * position_error;
-        Eigen::Vector3d desired_angular_vel = orientation_gain_ * orientation_error;
+        // ========== 计算误差导数（微分项） ==========
+        Eigen::Vector3d position_derivative, orientation_derivative;
         
-        // Limit velocities
+        if (first_control_cycle_) {
+            // 第一个控制周期，导数设为0
+            position_derivative.setZero();
+            orientation_derivative.setZero();
+            first_control_cycle_ = false;
+        } else {
+            // 计算原始导数
+            position_derivative = (position_error - last_position_error_) / dt_;
+            orientation_derivative = (orientation_error - last_orientation_error_) / dt_;
+            
+            // 对导数进行低通滤波以减少噪声
+            filtered_position_derivative_ = derivative_filter_alpha_ * position_derivative + 
+                                          (1.0 - derivative_filter_alpha_) * filtered_position_derivative_;
+            filtered_orientation_derivative_ = derivative_filter_alpha_ * orientation_derivative + 
+                                             (1.0 - derivative_filter_alpha_) * filtered_orientation_derivative_;
+            
+            position_derivative = filtered_position_derivative_;
+            orientation_derivative = filtered_orientation_derivative_;
+        }
+        
+        // 保存当前误差供下次使用
+        last_position_error_ = position_error;
+        last_orientation_error_ = orientation_error;
+        
+        // ========== PD控制律 ==========
+        // u = Kp * e + Kd * de/dt
+        Eigen::Vector3d desired_linear_vel = position_kp_ * position_error + 
+                                            position_kd_ * position_derivative;
+        Eigen::Vector3d desired_angular_vel = orientation_kp_ * orientation_error + 
+                                             orientation_kd_ * orientation_derivative;
+        
+        // ========== 应用速度限制 ==========
         desired_linear_vel = limitVector(desired_linear_vel, max_linear_vel_);
         desired_angular_vel = limitVector(desired_angular_vel, max_angular_vel_);
         
-        // Apply acceleration limits
+        // ========== 应用加速度限制 ==========
         desired_linear_vel = applyAccelerationLimit(desired_linear_vel, last_linear_vel_, max_linear_acc_);
         desired_angular_vel = applyAccelerationLimit(desired_angular_vel, last_angular_vel_, max_angular_acc_);
         
-        // Apply low-pass filter
+        // ========== 应用输出滤波 ==========
         filtered_linear_vel_ = filter_alpha_ * desired_linear_vel + 
                               (1.0 - filter_alpha_) * filtered_linear_vel_;
         filtered_angular_vel_ = filter_alpha_ * desired_angular_vel + 
                                (1.0 - filter_alpha_) * filtered_angular_vel_;
         
-                // 低通滤波后的速度（仍在 RViz/base_link 轴向）
+        // 应用速度死区（避免微小抖动）
+        filtered_linear_vel_ = applyDeadzone(filtered_linear_vel_, velocity_deadzone_);
+        filtered_angular_vel_ = applyDeadzone(filtered_angular_vel_, velocity_deadzone_);
+        
+        // ========== 坐标变换 ==========
         Eigen::Vector3d lin_rviz = filtered_linear_vel_;
         Eigen::Vector3d ang_rviz = filtered_angular_vel_;
 
-        // 用 3x3 置换矩阵映射到控制器坐标
+        // 用置换矩阵映射到控制器坐标
         Eigen::Vector3d lin_ctrl = R_ctrl_from_rviz_ * lin_rviz;
         Eigen::Vector3d ang_ctrl = R_ctrl_from_rviz_ * ang_rviz;
 
-        Eigen::Vector3d ang_ctrl_out = ang_ctrl;  // 默认按 rad/s
+        Eigen::Vector3d ang_ctrl_out = ang_ctrl;
         if (publish_ang_in_degrees_) {
             constexpr double RAD2DEG = 180.0 / M_PI;
-            ang_ctrl_out *= RAD2DEG;  // 转成 deg/s
+            ang_ctrl_out *= RAD2DEG;
         }
 
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            "CTRL Linear vel: [%.3f, %.3f, %.3f] m/s, Angular vel: [%.3f, %.3f, %.3f] %s",
-            lin_ctrl.x(), lin_ctrl.y(), lin_ctrl.z(),
-            ang_ctrl_out.x(), ang_ctrl_out.y(), ang_ctrl_out.z(),
-            publish_ang_in_degrees_ ? "deg/s" : "rad/s");
-
         // Update last velocities
-        
         last_linear_vel_ = filtered_linear_vel_;
         last_angular_vel_ = filtered_angular_vel_;
         
-        // Publish twist command
+        // ========== 发布控制命令 ==========
         geometry_msgs::msg::Twist twist_msg;
         twist_msg.linear.x  = lin_ctrl.x();
         twist_msg.linear.y  = lin_ctrl.y();
@@ -540,50 +607,55 @@ private:
         
         twist_pub_->publish(twist_msg);
         
-        // Debug output
+        // ========== 调试输出 ==========
         static int counter = 0;
-        if (++counter % static_cast<int>(control_frequency_) == 0) {  // Once per second
-            RCLCPP_DEBUG(this->get_logger(), 
-                        "Linear vel: [%.3f, %.3f, %.3f] m/s, Angular vel: [%.3f, %.3f, %.3f] rad/s",
-                        filtered_linear_vel_.x(), filtered_linear_vel_.y(), filtered_linear_vel_.z(),
-                        filtered_angular_vel_.x(), filtered_angular_vel_.y(), filtered_angular_vel_.z());
-            RCLCPP_DEBUG(this->get_logger(), 
-                        "Position error: [%.3f, %.3f, %.3f] m, Orientation error: [%.3f, %.3f, %.3f] rad",
-                        position_error.x(), position_error.y(), position_error.z(),
-                        orientation_error.x(), orientation_error.y(), orientation_error.z());
+        if (++counter % static_cast<int>(control_frequency_) == 0) {  // 每秒一次
+            RCLCPP_INFO(this->get_logger(), 
+                       "PD Control | Pos err: [%.3f, %.3f, %.3f]m | Orient err: [%.3f, %.3f, %.3f]rad",
+                       position_error.x(), position_error.y(), position_error.z(),
+                       orientation_error.x(), orientation_error.y(), orientation_error.z());
+            
+            RCLCPP_INFO(this->get_logger(), 
+                       "Derivatives | Pos: [%.3f, %.3f, %.3f]m/s | Orient: [%.3f, %.3f, %.3f]rad/s",
+                       position_derivative.x(), position_derivative.y(), position_derivative.z(),
+                       orientation_derivative.x(), orientation_derivative.y(), orientation_derivative.z());
+            
+            RCLCPP_INFO(this->get_logger(),
+                       "Output vel | Linear: [%.3f, %.3f, %.3f]m/s | Angular: [%.3f, %.3f, %.3f]%s",
+                       lin_ctrl.x(), lin_ctrl.y(), lin_ctrl.z(),
+                       ang_ctrl_out.x(), ang_ctrl_out.y(), ang_ctrl_out.z(),
+                       publish_ang_in_degrees_ ? "deg/s" : "rad/s");
         }
     }
     
     void gripperControlLoop()
     {
-    // 变化不大就不发，防抖
-    if (std::abs(gripper_command_ - last_gripper_command_) < 0.01) {
-        return;
-    }
+        // 变化不大就不发，防抖
+        if (std::abs(gripper_command_ - last_gripper_command_) < 0.01) {
+            return;
+        }
 
-    if (!gripper_action_client_->action_server_is_ready()) {
-        RCLCPP_DEBUG(this->get_logger(), "Gripper action server not ready");
-        return;
-    }
+        if (!gripper_action_client_->action_server_is_ready()) {
+            RCLCPP_DEBUG(this->get_logger(), "Gripper action server not ready");
+            return;
+        }
 
-    // 如需百分比→开度映射，请在这里换算；你现在按百分比发就保持不变
-    auto goal_msg = GripperCommand::Goal();
-    goal_msg.command.position = gripper_command_;   // 你确定服务器按百分比解释即可
-    goal_msg.command.max_effort = 20.0;
+        auto goal_msg = GripperCommand::Goal();
+        goal_msg.command.position = gripper_command_;
+        goal_msg.command.max_effort = 10.0;
 
-    // 若上个 goal 仍在执行，发起取消（非阻塞）
-    if (current_gripper_goal_ &&
-        current_gripper_goal_->get_status() == rclcpp_action::GoalStatus::STATUS_EXECUTING) {
-        (void)gripper_action_client_->async_cancel_goal(current_gripper_goal_);
-    }
+        // 若上个goal仍在执行，发起取消（非阻塞）
+        if (current_gripper_goal_ &&
+            current_gripper_goal_->get_status() == rclcpp_action::GoalStatus::STATUS_EXECUTING) {
+            (void)gripper_action_client_->async_cancel_goal(current_gripper_goal_);
+        }
 
-    RCLCPP_DEBUG(this->get_logger(), "Sending gripper command: %.3f", gripper_command_);
+        RCLCPP_DEBUG(this->get_logger(), "Sending gripper command: %.3f", gripper_command_);
 
-    // 直接发即可，future 不用 then，不用 get（避免阻塞）
-    (void)gripper_action_client_->async_send_goal(goal_msg, send_goal_options_);
+        // 直接发送
+        (void)gripper_action_client_->async_send_goal(goal_msg, send_goal_options_);
 
-    // 记录这次（用于防抖）
-    last_gripper_command_ = gripper_command_;
+        last_gripper_command_ = gripper_command_;
     }
 };
 
