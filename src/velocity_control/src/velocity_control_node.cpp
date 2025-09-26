@@ -52,10 +52,10 @@ public:
         this->declare_parameter("max_angular_acceleration", 5.0); 
         
         // 改进的滤波参数
-        this->declare_parameter("target_filter_alpha", 0.95);      // 目标极轻滤波（快速响应）
-        this->declare_parameter("current_filter_alpha", 0.95);      // 当前位姿轻滤波（减少测量噪音）
-        this->declare_parameter("error_filter_alpha", 0.8);        // 误差滤波（用于比例项和微分项）
-        this->declare_parameter("velocity_filter_alpha", 0.7);     // 速度输出滤波（可以更轻）
+        this->declare_parameter("target_filter_alpha", 1.0);      // 目标极轻滤波（快速响应）
+        this->declare_parameter("current_filter_alpha", 1.0);      // 当前位姿轻滤波（减少测量噪音）
+        this->declare_parameter("error_filter_alpha", 0.3);        // 误差滤波（用于比例项和微分项）
+        this->declare_parameter("velocity_filter_alpha", 0.2);     // 速度输出滤波（可以更轻）
         
         // 速度死区参数（只保留速度死区）
         this->declare_parameter("velocity_deadzone", 0.003);      // 速度死区
