@@ -1,11 +1,11 @@
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <control_msgs/action/gripper_command.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
-#include <trajectory_msgs/msg/joint_trajectory.hpp>
-#include <trajectory_msgs/msg/joint_trajectory_point.hpp>
 #include <kdl_parser/kdl_parser.hpp>
 #include <kdl/chainfksolverpos_recursive.hpp>
 #include <tf2/LinearMath/Quaternion.h>
@@ -18,6 +18,7 @@
 #include <fstream>
 
 using namespace std::chrono_literals;
+using GripperCommand = control_msgs::action::GripperCommand;
 
 class VelocityControlNode : public rclcpp::Node
 {
@@ -27,6 +28,7 @@ public:
         // Declare parameters
         this->declare_parameter("robot_urdf_path", "/home/ming/xrrobotics_new/XRoboToolkit-Teleop-Sample-Python/assets/arx/Gen/GEN3-7DOF.urdf");
         this->declare_parameter("control_frequency", 100.0);
+        this->declare_parameter("gripper_control_frequency", 10.0);  // Lower frequency for gripper
         this->declare_parameter("base_link", "base_link");
         this->declare_parameter("end_effector_link", "bracelet_link");
         
@@ -44,6 +46,7 @@ public:
         // Get parameters
         urdf_path_ = this->get_parameter("robot_urdf_path").as_string();
         control_frequency_ = this->get_parameter("control_frequency").as_double();
+        gripper_control_frequency_ = this->get_parameter("gripper_control_frequency").as_double();
         base_link_ = this->get_parameter("base_link").as_string();
         end_effector_link_ = this->get_parameter("end_effector_link").as_string();
         
@@ -76,10 +79,6 @@ public:
             "/cartesian_target", 10,
             std::bind(&VelocityControlNode::targetPoseCallback, this, std::placeholders::_1));
         
-        current_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-            "/current_ee_pose", 10,
-            std::bind(&VelocityControlNode::currentPoseCallback, this, std::placeholders::_1));
-        
         gripper_cmd_sub_ = this->create_subscription<std_msgs::msg::Float64>(
             "/gripper_command", 10,
             std::bind(&VelocityControlNode::gripperCommandCallback, this, std::placeholders::_1));
@@ -92,9 +91,50 @@ public:
         twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
             "/twist_controller/commands", 10);
         
-        gripper_trajectory_pub_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
-            "/robotiq_gripper_controller/joint_trajectory", 10);
+        // Create action client for gripper control
+        gripper_action_client_ = rclcpp_action::create_client<GripperCommand>(
+            this, "/robotiq_gripper_controller/gripper_cmd");
         
+        // Wait for action server
+        if (!gripper_action_client_->wait_for_action_server(5s)) {
+            RCLCPP_WARN(this->get_logger(), 
+                       "Gripper action server not available after waiting 5 seconds. "
+                       "Gripper control will not work.");
+        } else {
+            RCLCPP_INFO(this->get_logger(), "Gripper action server is available");
+        }
+        
+                // 配置 action 回调（非阻塞）
+        send_goal_options_.goal_response_callback =
+        [this](rclcpp_action::ClientGoalHandle<GripperCommand>::SharedPtr handle)
+        {
+            if (!handle) {
+            RCLCPP_WARN(this->get_logger(), "Gripper goal rejected");
+            } else {
+            this->current_gripper_goal_ = handle;  // 存句柄，后续可取消
+            RCLCPP_DEBUG(this->get_logger(), "Gripper goal accepted");
+            }
+        };
+
+        send_goal_options_.feedback_callback =
+        [this](rclcpp_action::ClientGoalHandle<GripperCommand>::SharedPtr /*handle*/,
+                const std::shared_ptr<const GripperCommand::Feedback> feedback)
+        {
+            // 可选：打印/使用反馈
+            // RCLCPP_DEBUG(this->get_logger(), "Gripper pos=%.3f, effort=%.3f",
+            //              feedback->position, feedback->effort);
+        };
+
+        send_goal_options_.result_callback =
+        [this](const rclcpp_action::ClientGoalHandle<GripperCommand>::WrappedResult &result)
+        {
+            if (result.code != rclcpp_action::ResultCode::SUCCEEDED) {
+            RCLCPP_WARN(this->get_logger(), "Gripper goal finished with code %d", (int)result.code);
+            } else {
+            RCLCPP_DEBUG(this->get_logger(), "Gripper goal succeeded");
+            }
+        };
+
         // Create service client for controller switching
         controller_switch_client_ = this->create_client<controller_manager_msgs::srv::SwitchController>(
             "/controller_manager/switch_controller");
@@ -115,18 +155,25 @@ public:
             throw std::runtime_error("Controller switch failed");
         }
         
-        // Create control timer
+        // Create control timer for velocity control
         auto period = std::chrono::duration<double>(dt_);
         control_timer_ = this->create_wall_timer(
             std::chrono::duration_cast<std::chrono::nanoseconds>(period),
             std::bind(&VelocityControlNode::controlLoop, this));
+        
+        // Create timer for gripper control (lower frequency)
+        auto gripper_period = std::chrono::duration<double>(1.0 / gripper_control_frequency_);
+        gripper_timer_ = this->create_wall_timer(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(gripper_period),
+            std::bind(&VelocityControlNode::gripperControlLoop, this));
         
         RCLCPP_INFO(this->get_logger(), "Velocity Control Node initialized");
         RCLCPP_INFO(this->get_logger(), "Position gain: %.2f, Orientation gain: %.2f", 
                    position_gain_, orientation_gain_);
         RCLCPP_INFO(this->get_logger(), "Max linear vel: %.2f m/s, Max angular vel: %.2f rad/s", 
                    max_linear_vel_, max_angular_vel_);
-        RCLCPP_INFO(this->get_logger(), "Control frequency: %.1f Hz", control_frequency_);
+        RCLCPP_INFO(this->get_logger(), "Control frequency: %.1f Hz, Gripper frequency: %.1f Hz", 
+                   control_frequency_, gripper_control_frequency_);
     }
     
     ~VelocityControlNode()
@@ -140,13 +187,14 @@ private:
     std::unique_ptr<KDL::ChainFkSolverPos_recursive> fk_solver_;
     KDL::Chain kdl_chain_;
     KDL::JntArray current_joint_positions_;
+    KDL::Frame current_ee_frame_;
     std::vector<std::string> joint_names_;
     std::map<std::string, int> joint_name_to_index_;
     int num_joints_;
     
     // Parameters
     std::string urdf_path_, base_link_, end_effector_link_;
-    double control_frequency_, dt_;
+    double control_frequency_, gripper_control_frequency_, dt_;
     double position_gain_, orientation_gain_;
     double max_linear_vel_, max_angular_vel_;
     double max_linear_acc_, max_angular_acc_;
@@ -155,9 +203,7 @@ private:
     
     // Control states
     geometry_msgs::msg::PoseStamped target_pose_;
-    geometry_msgs::msg::PoseStamped current_pose_;
     bool target_received_ = false;
-    bool current_received_ = false;
     bool joints_initialized_ = false;
     
     // Velocity states
@@ -168,16 +214,19 @@ private:
     
     // Gripper state
     double gripper_command_ = 0.0;
+    double last_gripper_command_ = -1.0;  // Initialize to invalid value to force first send
+    rclcpp_action::Client<GripperCommand>::SendGoalOptions send_goal_options_;
+    rclcpp_action::Client<GripperCommand>::GoalHandle::SharedPtr current_gripper_goal_;
     
     // ROS interfaces
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_pose_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr current_pose_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr gripper_cmd_sub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
-    rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr gripper_trajectory_pub_;
+    rclcpp_action::Client<GripperCommand>::SharedPtr gripper_action_client_;
     rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr controller_switch_client_;
     rclcpp::TimerBase::SharedPtr control_timer_;
+    rclcpp::TimerBase::SharedPtr gripper_timer_;
     
     bool initializeFKSolver()
     {
@@ -284,27 +333,9 @@ private:
         target_received_ = true;
     }
     
-    void currentPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
-    {
-        current_pose_ = *msg;
-        current_received_ = true;
-    }
-    
     void gripperCommandCallback(const std_msgs::msg::Float64::SharedPtr msg)
     {
         gripper_command_ = msg->data;
-        
-        // Publish gripper trajectory
-        trajectory_msgs::msg::JointTrajectory gripper_traj;
-        gripper_traj.header.stamp = this->now();
-        gripper_traj.joint_names = {"robotiq_85_left_knuckle_joint"};
-        
-        trajectory_msgs::msg::JointTrajectoryPoint point;
-        point.positions = {gripper_command_};
-        point.time_from_start = rclcpp::Duration::from_seconds(0.1);
-        
-        gripper_traj.points.push_back(point);
-        gripper_trajectory_pub_->publish(gripper_traj);
     }
     
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
@@ -321,6 +352,33 @@ private:
             joints_initialized_ = true;
             RCLCPP_INFO(this->get_logger(), "Joint states initialized");
         }
+        
+        // Compute current end-effector pose using FK
+        if (joints_initialized_) {
+            fk_solver_->JntToCart(current_joint_positions_, current_ee_frame_);
+        }
+    }
+    
+    geometry_msgs::msg::PoseStamped kdlFrameToPoseMsg(const KDL::Frame& frame)
+    {
+        geometry_msgs::msg::PoseStamped pose_msg;
+        pose_msg.header.stamp = this->now();
+        pose_msg.header.frame_id = base_link_;
+        
+        // Position
+        pose_msg.pose.position.x = frame.p.x();
+        pose_msg.pose.position.y = frame.p.y();
+        pose_msg.pose.position.z = frame.p.z();
+        
+        // Orientation
+        double x, y, z, w;
+        frame.M.GetQuaternion(x, y, z, w);
+        pose_msg.pose.orientation.x = x;
+        pose_msg.pose.orientation.y = y;
+        pose_msg.pose.orientation.z = z;
+        pose_msg.pose.orientation.w = w;
+        
+        return pose_msg;
     }
     
     Eigen::Vector3d computeOrientationError(const Eigen::Quaterniond& current_quat,
@@ -373,27 +431,30 @@ private:
     
     void controlLoop()
     {
-        if (!target_received_ || !current_received_) {
+        if (!target_received_ || !joints_initialized_) {
             RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                                 "Waiting for target and current poses...");
+                                 "Waiting for target pose and joint states...");
             return;
         }
         
+        // Get current pose from FK
+        auto current_pose = kdlFrameToPoseMsg(current_ee_frame_);
+        
         // Compute position error
         Eigen::Vector3d position_error;
-        position_error << target_pose_.pose.position.x - current_pose_.pose.position.x,
-                         target_pose_.pose.position.y - current_pose_.pose.position.y,
-                         target_pose_.pose.position.z - current_pose_.pose.position.z;
+        position_error << target_pose_.pose.position.x - current_pose.pose.position.x,
+                         target_pose_.pose.position.y - current_pose.pose.position.y,
+                         target_pose_.pose.position.z - current_pose.pose.position.z;
         
         // Apply deadzone to position error
         position_error = applyDeadzone(position_error, position_deadzone_);
         
         // Compute orientation error
         Eigen::Quaterniond current_quat(
-            current_pose_.pose.orientation.w,
-            current_pose_.pose.orientation.x,
-            current_pose_.pose.orientation.y,
-            current_pose_.pose.orientation.z
+            current_pose.pose.orientation.w,
+            current_pose.pose.orientation.x,
+            current_pose.pose.orientation.y,
+            current_pose.pose.orientation.z
         );
         
         Eigen::Quaterniond target_quat(
@@ -453,6 +514,38 @@ private:
                         position_error.x(), position_error.y(), position_error.z(),
                         orientation_error.x(), orientation_error.y(), orientation_error.z());
         }
+    }
+    
+    void gripperControlLoop()
+    {
+    // 变化不大就不发，防抖
+    if (std::abs(gripper_command_ - last_gripper_command_) < 0.01) {
+        return;
+    }
+
+    if (!gripper_action_client_->action_server_is_ready()) {
+        RCLCPP_DEBUG(this->get_logger(), "Gripper action server not ready");
+        return;
+    }
+
+    // 如需百分比→开度映射，请在这里换算；你现在按百分比发就保持不变
+    auto goal_msg = GripperCommand::Goal();
+    goal_msg.command.position = gripper_command_;   // 你确定服务器按百分比解释即可
+    goal_msg.command.max_effort = 20.0;
+
+    // 若上个 goal 仍在执行，发起取消（非阻塞）
+    if (current_gripper_goal_ &&
+        current_gripper_goal_->get_status() == rclcpp_action::GoalStatus::STATUS_EXECUTING) {
+        (void)gripper_action_client_->async_cancel_goal(current_gripper_goal_);
+    }
+
+    RCLCPP_DEBUG(this->get_logger(), "Sending gripper command: %.3f", gripper_command_);
+
+    // 直接发即可，future 不用 then，不用 get（避免阻塞）
+    (void)gripper_action_client_->async_send_goal(goal_msg, send_goal_options_);
+
+    // 记录这次（用于防抖）
+    last_gripper_command_ = gripper_command_;
     }
 };
 

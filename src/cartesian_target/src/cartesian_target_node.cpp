@@ -70,9 +70,6 @@ public:
         // Create publishers
         target_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
             "/cartesian_target", 10);
-        
-        current_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
-            "/current_ee_pose", 10);
             
         gripper_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64>(
             "/gripper_command", 10);
@@ -135,7 +132,6 @@ private:
     rclcpp::Subscription<xr_interfaces::msg::Pose>::SharedPtr right_controller_pose_sub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target_pose_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr current_pose_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gripper_cmd_pub_;
     
     rclcpp::TimerBase::SharedPtr timer_;
@@ -191,7 +187,7 @@ private:
     void initializeTransforms()
     {
         // R_HEADSET_TO_WORLD (same as IK node)
-        R_headset_world_ << 0, 0, -1,
+        R_headset_world_ <<0, 0, -1,
                            -1, 0, 0,
                            0, 1, 0;
         
@@ -326,10 +322,6 @@ private:
             RCLCPP_DEBUG(this->get_logger(), "Waiting for joint states and XR data...");
             return;
         }
-        
-        // Publish current end-effector pose
-        auto current_pose_msg = kdlFrameToPoseMsg(current_ee_frame_);
-        current_pose_pub_->publish(current_pose_msg);
         
         // Check activation state
         bool new_active = (current_grip_value_ > 0.9);

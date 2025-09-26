@@ -8,10 +8,12 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(control_msgs REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_kdl REQUIRED)
@@ -30,9 +32,11 @@ target_include_directories(velocity_control_node PRIVATE
 
 ament_target_dependencies(velocity_control_node
   rclcpp
+  rclcpp_action
   geometry_msgs
   sensor_msgs
   std_msgs
+  control_msgs
   tf2
   tf2_kdl
   trajectory_msgs
