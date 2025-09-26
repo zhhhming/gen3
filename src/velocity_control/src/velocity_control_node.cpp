@@ -40,31 +40,35 @@ public:
         this->declare_parameter("end_effector_link", "bracelet_link");
         
         // PD控制参数
-        this->declare_parameter("position_kp", 3.0);      // 位置比例增益（稍微提高）
-        this->declare_parameter("position_kd", 2.0);      // 位置微分增益（新增）
-        this->declare_parameter("orientation_kp", 3.0);   // 姿态比例增益（稍微提高）
-        this->declare_parameter("orientation_kd", 2.0);   // 姿态微分增益（新增）
+        this->declare_parameter("position_kp", 3.0);      // 位置比例增益
+        this->declare_parameter("position_kd", 2.0);      // 位置微分增益
+        this->declare_parameter("orientation_kp", 3.0);   // 姿态比例增益
+        this->declare_parameter("orientation_kd", 2.0);   // 姿态微分增益
         
-        // 速度和加速度限制（调整）
-        this->declare_parameter("max_linear_velocity", 0.5);      // 降低最大线速度以提高稳定性
-        this->declare_parameter("max_angular_velocity", 1.0);     // 降低最大角速度
-        this->declare_parameter("max_linear_acceleration", 2.0);  // 降低加速度限制以更平滑
-        this->declare_parameter("max_angular_acceleration", 5.0); // 降低角加速度
+        // 速度和加速度限制
+        this->declare_parameter("max_linear_velocity", 0.5);      
+        this->declare_parameter("max_angular_velocity", 1.0);     
+        this->declare_parameter("max_linear_acceleration", 2.0);  
+        this->declare_parameter("max_angular_acceleration", 5.0); 
         
-        // 滤波参数
-        this->declare_parameter("velocity_filter_alpha", 0.5);    // 降低滤波系数以更平滑
-        this->declare_parameter("derivative_filter_alpha", 0.5);  // 微分项滤波（新增）
+        // 改进的滤波参数
+        this->declare_parameter("target_filter_alpha", 0.95);      // 目标极轻滤波（快速响应）
+        this->declare_parameter("current_filter_alpha", 0.95);      // 当前位姿轻滤波（减少测量噪音）
+        this->declare_parameter("error_filter_alpha", 0.8);        // 误差滤波（用于比例项）
+        this->declare_parameter("derivative_filter_alpha", 0.3);   // 微分项滤波（更强滤波）
+        this->declare_parameter("velocity_filter_alpha", 0.7);     // 速度输出滤波（可以更轻）
         
         // 死区参数
         this->declare_parameter("deadzone", 0.002);               // 2mm位置死区
-        this->declare_parameter("angular_deadzone", 0.015);        // ~0.57度姿态死区
-        this->declare_parameter("velocity_deadzone", 0.003);      // 速度死区（新增）
+        this->declare_parameter("angular_deadzone", 0.015);       // ~0.57度姿态死区
+        this->declare_parameter("velocity_deadzone", 0.003);      // 速度死区
         
         this->declare_parameter("publish_angular_in_degrees", true);
         this->declare_parameter("log_enabled", true);
         this->declare_parameter("log_dir", std::string("./vc_logs"));
-        this->declare_parameter("plot_script", std::string("/home/ming/ros2_ws/vc_logs/plot_vc_log.py"));  // 为空则不画
+        this->declare_parameter("plot_script", std::string("/home/ming/ros2_ws/vc_logs/plot_vc_log.py"));
         this->declare_parameter("python_interpreter", std::string("/home/ming/miniconda3/envs/xrrobotics/bin/python"));
+        
         python_interpreter_ = this->get_parameter("python_interpreter").as_string();
         plot_script_ = this->get_parameter("plot_script").as_string();
 
@@ -87,9 +91,12 @@ public:
         max_linear_acc_ = this->get_parameter("max_linear_acceleration").as_double();
         max_angular_acc_ = this->get_parameter("max_angular_acceleration").as_double();
         
-        // 滤波参数
-        filter_alpha_ = this->get_parameter("velocity_filter_alpha").as_double();
+        // 改进的滤波参数
+        target_filter_alpha_ = this->get_parameter("target_filter_alpha").as_double();
+        current_filter_alpha_ = this->get_parameter("current_filter_alpha").as_double();
+        error_filter_alpha_ = this->get_parameter("error_filter_alpha").as_double();
         derivative_filter_alpha_ = this->get_parameter("derivative_filter_alpha").as_double();
+        filter_alpha_ = this->get_parameter("velocity_filter_alpha").as_double();
         
         // 死区
         position_deadzone_ = this->get_parameter("deadzone").as_double();
@@ -117,12 +124,22 @@ public:
         last_linear_vel_.setZero();
         last_angular_vel_.setZero();
         
+        // 初始化滤波后的位姿和误差
+        filtered_target_position_.setZero();
+        filtered_target_quaternion_ = Eigen::Quaterniond::Identity();
+        filtered_current_position_.setZero();
+        filtered_current_quaternion_ = Eigen::Quaterniond::Identity();
+        filtered_position_error_.setZero();
+        filtered_orientation_error_.setZero();
+        
         // 初始化PD控制相关变量
         last_position_error_.setZero();
         last_orientation_error_.setZero();
         filtered_position_derivative_.setZero();
         filtered_orientation_derivative_.setZero();
         first_control_cycle_ = true;
+        target_initialized_ = false;
+        current_initialized_ = false;
         
         // Create subscribers
         target_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -225,16 +242,14 @@ public:
                 log_enabled_ = false;
             }
         }
-        RCLCPP_INFO(this->get_logger(), "PD Velocity Control Node initialized");
+        RCLCPP_INFO(this->get_logger(), "PD Velocity Control Node initialized with improved filtering");
+        RCLCPP_INFO(this->get_logger(), "Filter alphas - Target: %.2f, Current: %.2f, Error: %.2f, Derivative: %.2f, Velocity: %.2f",
+                   target_filter_alpha_, current_filter_alpha_, error_filter_alpha_, 
+                   derivative_filter_alpha_, filter_alpha_);
         RCLCPP_INFO(this->get_logger(), "Position: Kp=%.2f, Kd=%.2f | Orientation: Kp=%.2f, Kd=%.2f", 
                    position_kp_, position_kd_, orientation_kp_, orientation_kd_);
-        RCLCPP_INFO(this->get_logger(), "Max linear vel: %.2f m/s, Max angular vel: %.2f rad/s", 
-                   max_linear_vel_, max_angular_vel_);
-        RCLCPP_INFO(this->get_logger(), "Max linear acc: %.2f m/s², Max angular acc: %.2f rad/s²", 
-                   max_linear_acc_, max_angular_acc_);
-        RCLCPP_INFO(this->get_logger(), "Control frequency: %.1f Hz, Gripper frequency: %.1f Hz", 
-                   control_frequency_, gripper_control_frequency_);
     }
+    
     void saveLogsToCsvAndPlots()
     {
         if (!log_enabled_ || logs_.empty()) return;
@@ -326,13 +341,10 @@ public:
             return;
         }
 
-        // === 2) 调用外部 Python 绘图脚本（如果提供了路径） ===
+        // === 2) 调用外部 Python 绘图脚本 ===
         if (!plot_script_.empty()) {
             try {
-                // 角速度单位标签：与你的 publish_ang_in_degrees_ 一致
                 std::string ang_unit = publish_ang_in_degrees_ ? "deg/s" : "rad/s";
-
-                // 例如：python3 /path/to/plot_vc_log.py --csv "<csv_path>" --outdir "<log_dir_>" --ang-unit "deg/s"
                 std::string cmd = "\"" + python_interpreter_ + "\" \"" + plot_script_ + "\""
                                 " --csv \"" + csv_path + "\""
                                 " --outdir \"" + log_dir_ + "\""
@@ -351,9 +363,6 @@ public:
         } else {
             std::cerr << "[save] plot_script parameter is empty. Skipping plot.\n";
         }
-
-
-
     }
     
     ~VelocityControlNode()
@@ -361,10 +370,10 @@ public:
         if (control_timer_) control_timer_->cancel();
         if (gripper_timer_) gripper_timer_->cancel();
         try {
-                saveLogsToCsvAndPlots();  // 仅本地文件操作
-            } catch (...) {
-                // 静默
-            }
+            saveLogsToCsvAndPlots();
+        } catch (...) {
+            // 静默
+        }
     }
     
 private:
@@ -390,8 +399,11 @@ private:
     double max_linear_acc_, max_angular_acc_;
     
     // 滤波参数
-    double filter_alpha_;
-    double derivative_filter_alpha_;
+    double filter_alpha_;                  // 速度输出滤波
+    double derivative_filter_alpha_;       // 微分项滤波
+    double target_filter_alpha_;          // 目标位姿滤波
+    double current_filter_alpha_;         // 当前位姿滤波  
+    double error_filter_alpha_;           // 误差滤波
     
     // 死区
     double position_deadzone_, angular_deadzone_;
@@ -403,6 +415,8 @@ private:
     bool joints_initialized_ = false;
     bool publish_ang_in_degrees_ = true;
     bool first_control_cycle_ = true;
+    bool target_initialized_ = false;
+    bool current_initialized_ = false;
 
     // ===== Logging =====
     bool log_enabled_ = true;
@@ -415,6 +429,14 @@ private:
     Eigen::Vector3d last_linear_vel_;
     Eigen::Vector3d last_angular_vel_;
     Eigen::Matrix3d R_ctrl_from_rviz_;
+    
+    // 滤波后的位姿和误差
+    Eigen::Vector3d filtered_target_position_;
+    Eigen::Quaterniond filtered_target_quaternion_;
+    Eigen::Vector3d filtered_current_position_;
+    Eigen::Quaterniond filtered_current_quaternion_;
+    Eigen::Vector3d filtered_position_error_;
+    Eigen::Vector3d filtered_orientation_error_;
     
     // PD控制相关状态
     Eigen::Vector3d last_position_error_;
@@ -442,29 +464,19 @@ private:
 
     struct LogSample {
         double t;
-
-        // 当前末端位姿（base_link）
         Eigen::Vector3d pos;
         Eigen::Quaterniond quat;
         Eigen::Vector3d axis_angle_vec;
-
-        // 误差（rviz坐标系）
-        Eigen::Vector3d pos_err; // m
-        Eigen::Vector3d ori_err; // rad (角轴小角向量)
-
-        // 误差导数（原始/滤波后）
-        Eigen::Vector3d pos_err_der_raw;   // m/s
-        Eigen::Vector3d pos_err_der_filt;  // m/s
-        Eigen::Vector3d ori_err_der_raw;   // rad/s
-        Eigen::Vector3d ori_err_der_filt;  // rad/s
-
-        // PD 分量（rviz坐标系）
-        Eigen::Vector3d lin_p; // = Kp*pos_err (m/s)
-        Eigen::Vector3d lin_d; // = Kd*pos_err_der_filt (m/s)
-        Eigen::Vector3d ang_p; // = Kp*ori_err (rad/s)
-        Eigen::Vector3d ang_d; // = Kd*ori_err_der_filt (rad/s)
-
-        // 速度指令分阶段（rviz坐标系；角速度均为 rad/s）
+        Eigen::Vector3d pos_err;
+        Eigen::Vector3d ori_err;
+        Eigen::Vector3d pos_err_der_raw;
+        Eigen::Vector3d pos_err_der_filt;
+        Eigen::Vector3d ori_err_der_raw;
+        Eigen::Vector3d ori_err_der_filt;
+        Eigen::Vector3d lin_p;
+        Eigen::Vector3d lin_d;
+        Eigen::Vector3d ang_p;
+        Eigen::Vector3d ang_d;
         Eigen::Vector3d lin_des_before_limit;
         Eigen::Vector3d ang_des_before_limit;
         Eigen::Vector3d lin_after_vel_limit;
@@ -473,8 +485,6 @@ private:
         Eigen::Vector3d ang_after_acc_limit;
         Eigen::Vector3d lin_after_filter;
         Eigen::Vector3d ang_after_filter;
-
-        // 最终下发（控制器坐标系；角速度可能是 deg/s，取决于 publish_ang_in_degrees_）
         Eigen::Vector3d lin_cmd_ctrl;     
         Eigen::Vector3d ang_cmd_ctrl_out; 
     };
@@ -583,6 +593,35 @@ private:
     {
         target_pose_ = *msg;
         target_received_ = true;
+        
+        // 对目标位姿进行极轻滤波
+        Eigen::Vector3d new_target_position(
+            msg->pose.position.x,
+            msg->pose.position.y,
+            msg->pose.position.z
+        );
+        
+        Eigen::Quaterniond new_target_quaternion(
+            msg->pose.orientation.w,
+            msg->pose.orientation.x,
+            msg->pose.orientation.y,
+            msg->pose.orientation.z
+        );
+        
+        if (!target_initialized_) {
+            // 第一次初始化
+            filtered_target_position_ = new_target_position;
+            filtered_target_quaternion_ = new_target_quaternion;
+            target_initialized_ = true;
+        } else {
+            // 极轻滤波（快速响应）
+            filtered_target_position_ = target_filter_alpha_ * new_target_position + 
+                                       (1.0 - target_filter_alpha_) * filtered_target_position_;
+            
+            // 四元数球面插值
+            filtered_target_quaternion_ = filtered_target_quaternion_.slerp(
+                target_filter_alpha_, new_target_quaternion);
+        }
     }
     
     void gripperCommandCallback(const std_msgs::msg::Float64::SharedPtr msg)
@@ -638,21 +677,19 @@ private:
     {
         Eigen::Quaterniond qc = current_quat.normalized();
         Eigen::Quaterniond qt = target_quat.normalized();
-        Eigen::Quaterniond qe = qt * qc.conjugate();     // 误差: 从 current 旋到 target
-        if (qe.w() < 0.0) { qe.coeffs() *= -1.0; }       // 取最短路径（不改变实际旋转）
+        Eigen::Quaterniond qe = qt * qc.conjugate();
+        if (qe.w() < 0.0) { qe.coeffs() *= -1.0; }
 
-        // log(q) = (theta * axis), 其中 theta = 2*atan2(||v||, w), v=vec(q)
         const double w = std::clamp(qe.w(), -1.0, 1.0);
         const Eigen::Vector3d v = qe.vec();
         const double vnorm = v.norm();
         const double eps = 1e-9;
 
         if (vnorm < eps) {
-            // 小角度极限：theta*axis ≈ 2*v
             return 2.0 * v;
         } else {
-            const double theta = 2.0 * std::atan2(vnorm, w); // ∈ (0, π]
-            return (theta / vnorm) * v;  // = angle * axis
+            const double theta = 2.0 * std::atan2(vnorm, w);
+            return (theta / vnorm) * v;
         }
     }
 
@@ -663,7 +700,6 @@ private:
             if (std::abs(value[i]) < deadzone) {
                 result[i] = 0.0;
             } else {
-                // 可选：从死区边缘开始计算（避免突变）
                 double sign = (value[i] > 0) ? 1.0 : -1.0;
                 result[i] = sign * (std::abs(value[i]) - deadzone);
             }
@@ -687,25 +723,21 @@ private:
         Eigen::Vector3d vel_diff = desired_vel - last_vel;
         double max_change = max_acc * dt_;
         
-        // Limit the velocity change
         vel_diff = limitVector(vel_diff, max_change);
         
         return last_vel + vel_diff;
     }
+    
     Eigen::Vector3d quatToAxisAngleVec(const Eigen::Quaterniond& q_in)
     {
-        // 归一化，构造 AngleAxis
         Eigen::Quaterniond q = q_in.normalized();
         Eigen::AngleAxisd aa(q);
-        // 轴向量*角度（弧度），这样便于画三个通道
         return aa.angle() * aa.axis();
     }
     
-
-
     void controlLoop()
     {
-        if (!target_received_ || !joints_initialized_) {
+        if (!target_received_ || !joints_initialized_ || !target_initialized_) {
             RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                                  "Waiting for target pose and joint states...");
             return;
@@ -714,100 +746,117 @@ private:
         // Get current pose from FK
         auto current_pose = kdlFrameToPoseMsg(current_ee_frame_);
         
-        // ========== 计算位置误差 ==========
-        Eigen::Vector3d position_error;
-        position_error << target_pose_.pose.position.x - current_pose.pose.position.x,
-                         target_pose_.pose.position.y - current_pose.pose.position.y,
-                         target_pose_.pose.position.z - current_pose.pose.position.z;
-        //目标和当前位置未滤波
+        // ========== 对当前位姿进行轻滤波 ==========
+        Eigen::Vector3d raw_current_position(
+            current_pose.pose.position.x,
+            current_pose.pose.position.y,
+            current_pose.pose.position.z
+        );
         
-        // Apply deadzone to position error
-        position_error = applyDeadzone(position_error, position_deadzone_);
-        
-        // ========== 计算姿态误差 ==========
-        Eigen::Quaterniond current_quat(
+        Eigen::Quaterniond raw_current_quaternion(
             current_pose.pose.orientation.w,
             current_pose.pose.orientation.x,
             current_pose.pose.orientation.y,
             current_pose.pose.orientation.z
         );
         
-        Eigen::Quaterniond target_quat(
-            target_pose_.pose.orientation.w,
-            target_pose_.pose.orientation.x,
-            target_pose_.pose.orientation.y,
-            target_pose_.pose.orientation.z
-        );
+        if (!current_initialized_) {
+            // 第一次初始化
+            filtered_current_position_ = raw_current_position;
+            filtered_current_quaternion_ = raw_current_quaternion;
+            current_initialized_ = true;
+        } else {
+            // 轻滤波（减少测量噪音）
+            filtered_current_position_ = current_filter_alpha_ * raw_current_position + 
+                                        (1.0 - current_filter_alpha_) * filtered_current_position_;
+            
+            // 四元数球面插值
+            filtered_current_quaternion_ = filtered_current_quaternion_.slerp(
+                current_filter_alpha_, raw_current_quaternion);
+        }
         
-        //目标和当前位姿未滤波
-
-        Eigen::Vector3d orientation_error = computeOrientationError(current_quat, target_quat);
-        orientation_error = applyDeadzone(orientation_error, angular_deadzone_);
+        // ========== 计算原始误差（用于微分） ==========
+        Eigen::Vector3d raw_position_error = filtered_target_position_ - filtered_current_position_;
+        raw_position_error = applyDeadzone(raw_position_error, position_deadzone_);
+        
+        Eigen::Vector3d raw_orientation_error = computeOrientationError(
+            filtered_current_quaternion_, filtered_target_quaternion_);
+        raw_orientation_error = applyDeadzone(raw_orientation_error, angular_deadzone_);
+        
+        // ========== 滤波误差（用于比例项） ==========
+        if (first_control_cycle_) {
+            filtered_position_error_ = raw_position_error;
+            filtered_orientation_error_ = raw_orientation_error;
+        } else {
+            filtered_position_error_ = error_filter_alpha_ * raw_position_error + 
+                                      (1.0 - error_filter_alpha_) * filtered_position_error_;
+            filtered_orientation_error_ = error_filter_alpha_ * raw_orientation_error + 
+                                         (1.0 - error_filter_alpha_) * filtered_orientation_error_;
+        }
         
         // ========== 计算误差导数（微分项） ==========
         Eigen::Vector3d position_derivative_raw, orientation_derivative_raw;
         
         if (first_control_cycle_) {
-            // 第一个控制周期，导数设为0
             position_derivative_raw.setZero();
             orientation_derivative_raw.setZero();
             filtered_position_derivative_.setZero();
             filtered_orientation_derivative_.setZero();
             first_control_cycle_ = false;
         } else {
-                position_derivative_raw    = (position_error - last_position_error_) / dt_;
-                orientation_derivative_raw = (orientation_error - last_orientation_error_) / dt_;
-
-                filtered_position_derivative_   = derivative_filter_alpha_ * position_derivative_raw
-                                                + (1.0 - derivative_filter_alpha_) * filtered_position_derivative_;
-                filtered_orientation_derivative_ = derivative_filter_alpha_ * orientation_derivative_raw
-                                                + (1.0 - derivative_filter_alpha_) * filtered_orientation_derivative_;
+            // 先计算导数，再滤波（避免噪音放大）
+            position_derivative_raw = (raw_position_error - last_position_error_) / dt_;
+            orientation_derivative_raw = (raw_orientation_error - last_orientation_error_) / dt_;
+            
+            // 对导数进行强滤波
+            filtered_position_derivative_ = derivative_filter_alpha_ * position_derivative_raw + 
+                                           (1.0 - derivative_filter_alpha_) * filtered_position_derivative_;
+            filtered_orientation_derivative_ = derivative_filter_alpha_ * orientation_derivative_raw + 
+                                              (1.0 - derivative_filter_alpha_) * filtered_orientation_derivative_;
         }
-        Eigen::Vector3d position_derivative   = filtered_position_derivative_;
-        Eigen::Vector3d orientation_derivative = filtered_orientation_derivative_;
-        // 保存当前误差供下次使用
-        last_position_error_ = position_error;
-        last_orientation_error_ = orientation_error;
+        
+        // 保存当前原始误差供下次使用
+        last_position_error_ = raw_position_error;
+        last_orientation_error_ = raw_orientation_error;
         
         // ========== PD控制律 ==========
-        // u = Kp * e + Kd * de/dt
-        //kp的保存，kd的保存
-        Eigen::Vector3d lin_p = position_kp_   * position_error;
-        Eigen::Vector3d lin_d = position_kd_   * position_derivative;
-        Eigen::Vector3d ang_p = orientation_kp_* orientation_error;       // rad/s
-        Eigen::Vector3d ang_d = orientation_kd_* orientation_derivative;  // rad/s
+        // 比例项使用滤波后的误差，微分项使用滤波后的导数
+        Eigen::Vector3d lin_p = position_kp_ * filtered_position_error_;
+        Eigen::Vector3d lin_d = position_kd_ * filtered_position_derivative_;
+        Eigen::Vector3d ang_p = orientation_kp_ * filtered_orientation_error_;
+        Eigen::Vector3d ang_d = orientation_kd_ * filtered_orientation_derivative_;
 
         Eigen::Vector3d desired_linear_vel = lin_p + lin_d;
-        
         Eigen::Vector3d desired_angular_vel = ang_p + ang_d;
-        //用于记录
+        
+        // 记录
         Eigen::Vector3d lin_des_before_limit = desired_linear_vel;
         Eigen::Vector3d ang_des_before_limit = desired_angular_vel;
+        
         // ========== 应用速度限制 ==========
         desired_linear_vel = limitVector(desired_linear_vel, max_linear_vel_);
         desired_angular_vel = limitVector(desired_angular_vel, max_angular_vel_);
-        //速度限制后的保存
-        //用于记录
+        
         Eigen::Vector3d lin_after_vel_limit = desired_linear_vel;
         Eigen::Vector3d ang_after_vel_limit = desired_angular_vel;
         
         // ========== 应用加速度限制 ==========
         desired_linear_vel = applyAccelerationLimit(desired_linear_vel, last_linear_vel_, max_linear_acc_);
         desired_angular_vel = applyAccelerationLimit(desired_angular_vel, last_angular_vel_, max_angular_acc_);
-        //加速度限制后的保存
-        //用于记录
+        
         Eigen::Vector3d lin_after_acc_limit = desired_linear_vel;
         Eigen::Vector3d ang_after_acc_limit = desired_angular_vel;
-        // ========== 应用输出滤波 ==========
+        
+        // ========== 应用输出滤波（现在可以更轻） ==========
         filtered_linear_vel_ = filter_alpha_ * desired_linear_vel + 
                               (1.0 - filter_alpha_) * filtered_linear_vel_;
         filtered_angular_vel_ = filter_alpha_ * desired_angular_vel + 
                                (1.0 - filter_alpha_) * filtered_angular_vel_;
-        //滤波的保存
-        //用于记录
+        
         Eigen::Vector3d lin_after_filter = filtered_linear_vel_;
         Eigen::Vector3d ang_after_filter = filtered_angular_vel_;
-        // 应用速度死区（避免微小抖动）
+        
+        // 应用速度死区
         filtered_linear_vel_ = applyDeadzone(filtered_linear_vel_, velocity_deadzone_);
         filtered_angular_vel_ = applyDeadzone(filtered_angular_vel_, velocity_deadzone_);
         
@@ -815,7 +864,6 @@ private:
         Eigen::Vector3d lin_rviz = filtered_linear_vel_;
         Eigen::Vector3d ang_rviz = filtered_angular_vel_;
 
-        // 用置换矩阵映射到控制器坐标
         Eigen::Vector3d lin_ctrl = R_ctrl_from_rviz_ * lin_rviz;
         Eigen::Vector3d ang_ctrl = R_ctrl_from_rviz_ * ang_rviz;
 
@@ -839,41 +887,29 @@ private:
         twist_msg.angular.z = ang_ctrl_out.z();
         
         twist_pub_->publish(twist_msg);
+        
+        // ========== 记录日志 ==========
         if (log_enabled_) {
             LogSample s;
             s.t = (this->now() - start_time_).seconds();
 
-            // 当前末端位姿：用你已有的 current_pose
-            s.pos = Eigen::Vector3d(
-                current_pose.pose.position.x,
-                current_pose.pose.position.y,
-                current_pose.pose.position.z
-            );
-            s.quat = Eigen::Quaterniond(
-                current_pose.pose.orientation.w,
-                current_pose.pose.orientation.x,
-                current_pose.pose.orientation.y,
-                current_pose.pose.orientation.z
-            );
+            s.pos = filtered_current_position_;
+            s.quat = filtered_current_quaternion_;
             s.axis_angle_vec = quatToAxisAngleVec(s.quat);
 
-            // 误差（已经算好的）
-            s.pos_err = position_error;        // m
-            s.ori_err = orientation_error;     // rad
+            s.pos_err = raw_position_error;           // 使用原始误差记录
+            s.ori_err = raw_orientation_error;
 
-            // 导数（原始/滤波后）
             s.pos_err_der_raw  = position_derivative_raw;
             s.pos_err_der_filt = filtered_position_derivative_;
             s.ori_err_der_raw  = orientation_derivative_raw;
             s.ori_err_der_filt = filtered_orientation_derivative_;
 
-                // PD 分量
             s.lin_p = lin_p;
             s.lin_d = lin_d;
             s.ang_p = ang_p;
             s.ang_d = ang_d;
 
-                // 分阶段（rviz系，角速度单位：rad/s）
             s.lin_des_before_limit = lin_des_before_limit;
             s.ang_des_before_limit = ang_des_before_limit;
             s.lin_after_vel_limit  = lin_after_vel_limit;
@@ -883,24 +919,24 @@ private:
             s.lin_after_filter     = lin_after_filter;
             s.ang_after_filter     = ang_after_filter;
 
-            // 速度指令（控制器坐标，已映射 & 角速度可能已转为deg/s）
-            s.lin_cmd_ctrl     = lin_ctrl;     // m/s
-            s.ang_cmd_ctrl_out = ang_ctrl_out; // rad/s or deg/s (依据配置)
+            s.lin_cmd_ctrl     = lin_ctrl;
+            s.ang_cmd_ctrl_out = ang_ctrl_out;
 
             logs_.push_back(std::move(s));
         }
+        
         // ========== 调试输出 ==========
         static int counter = 0;
-        if (++counter % static_cast<int>(control_frequency_) == 0) {  // 每秒一次
+        if (++counter % static_cast<int>(control_frequency_) == 0) {
             RCLCPP_INFO(this->get_logger(), 
-                       "PD Control | Pos err: [%.3f, %.3f, %.3f]m | Orient err: [%.3f, %.3f, %.3f]rad",
-                       position_error.x(), position_error.y(), position_error.z(),
-                       orientation_error.x(), orientation_error.y(), orientation_error.z());
+                       "Filtered Err | Pos: [%.3f, %.3f, %.3f]m | Orient: [%.3f, %.3f, %.3f]rad",
+                       filtered_position_error_.x(), filtered_position_error_.y(), filtered_position_error_.z(),
+                       filtered_orientation_error_.x(), filtered_orientation_error_.y(), filtered_orientation_error_.z());
             
             RCLCPP_INFO(this->get_logger(), 
                        "Derivatives | Pos: [%.3f, %.3f, %.3f]m/s | Orient: [%.3f, %.3f, %.3f]rad/s",
-                       position_derivative.x(), position_derivative.y(), position_derivative.z(),
-                       orientation_derivative.x(), orientation_derivative.y(), orientation_derivative.z());
+                       filtered_position_derivative_.x(), filtered_position_derivative_.y(), filtered_position_derivative_.z(),
+                       filtered_orientation_derivative_.x(), filtered_orientation_derivative_.y(), filtered_orientation_derivative_.z());
             
             RCLCPP_INFO(this->get_logger(),
                        "Output vel | Linear: [%.3f, %.3f, %.3f]m/s | Angular: [%.3f, %.3f, %.3f]%s",
@@ -912,7 +948,6 @@ private:
     
     void gripperControlLoop()
     {
-        // 变化不大就不发，防抖
         if (std::abs(gripper_command_ - last_gripper_command_) < 0.01) {
             return;
         }
@@ -926,15 +961,12 @@ private:
         goal_msg.command.position = gripper_command_;
         goal_msg.command.max_effort = 10.0;
 
-        // 若上个goal仍在执行，发起取消（非阻塞）
         if (current_gripper_goal_ &&
             current_gripper_goal_->get_status() == rclcpp_action::GoalStatus::STATUS_EXECUTING) {
             (void)gripper_action_client_->async_cancel_goal(current_gripper_goal_);
         }
 
         RCLCPP_DEBUG(this->get_logger(), "Sending gripper command: %.3f", gripper_command_);
-
-        // 直接发送
         (void)gripper_action_client_->async_send_goal(goal_msg, send_goal_options_);
 
         last_gripper_command_ = gripper_command_;
@@ -947,7 +979,6 @@ int main(int argc, char** argv)
     
     auto node = std::make_shared<VelocityControlNode>();
 
-    // 在全局 shutdown 时调用保存（仅做本地 IO，不做 ROS 调用）
     rclcpp::on_shutdown([node](){
         node->saveLogsToCsvAndPlots();
     });
