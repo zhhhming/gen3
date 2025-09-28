@@ -41,9 +41,9 @@ public:
         
         // PD控制参数
         this->declare_parameter("position_kp", 1.0);      // 位置比例增益
-        this->declare_parameter("position_kd", 8.0);      // 位置微分增益
+        this->declare_parameter("position_kd", 10.0);      // 位置微分增益
         this->declare_parameter("orientation_kp",1.0);   // 姿态比例增益
-        this->declare_parameter("orientation_kd", 0.7);   // 姿态微分增益
+        this->declare_parameter("orientation_kd", 2.0);   // 姿态微分增益
         
         // 速度和加速度限制
         this->declare_parameter("max_linear_velocity", 0.5);      
@@ -55,10 +55,11 @@ public:
         this->declare_parameter("target_filter_alpha", 1.0);      // 目标极轻滤波（快速响应）
         this->declare_parameter("current_filter_alpha", 1.0);      // 当前位姿轻滤波（减少测量噪音）
         this->declare_parameter("error_filter_alpha", 0.3);        // 误差滤波（用于比例项和微分项）
+        this->declare_parameter("derivative_filter_alpha", 0.5);   // 微分项滤波（新增）
         this->declare_parameter("velocity_filter_alpha", 0.2);     // 速度输出滤波（可以更轻）
         
         // 速度死区参数（只保留速度死区）
-        this->declare_parameter("velocity_deadzone", 0.003);      // 速度死区
+        this->declare_parameter("velocity_deadzone", 0.001);      // 速度死区
         
         // 微分项尖峰检测参数
         this->declare_parameter("error_near_zero_threshold", 0.005);  // 误差接近0的阈值
@@ -96,6 +97,7 @@ public:
         target_filter_alpha_ = this->get_parameter("target_filter_alpha").as_double();
         current_filter_alpha_ = this->get_parameter("current_filter_alpha").as_double();
         error_filter_alpha_ = this->get_parameter("error_filter_alpha").as_double();
+        derivative_filter_alpha_ = this->get_parameter("derivative_filter_alpha").as_double();  // 新增
         filter_alpha_ = this->get_parameter("velocity_filter_alpha").as_double();
         
         // 速度死区
@@ -137,6 +139,11 @@ public:
         // 初始化PD控制相关变量
         last_filtered_position_error_.setZero();
         last_filtered_orientation_error_.setZero();
+        
+        // 初始化滤波后的微分项 (新增)
+        filtered_position_derivative_.setZero();
+        filtered_orientation_derivative_.setZero();
+        
         first_control_cycle_ = true;
         target_initialized_ = false;
         current_initialized_ = false;
@@ -243,8 +250,8 @@ public:
             }
         }
         RCLCPP_INFO(this->get_logger(), "PD Velocity Control Node initialized with improved filtering");
-        RCLCPP_INFO(this->get_logger(), "Filter alphas - Target: %.2f, Current: %.2f, Error: %.2f, Velocity: %.2f",
-                   target_filter_alpha_, current_filter_alpha_, error_filter_alpha_, filter_alpha_);
+        RCLCPP_INFO(this->get_logger(), "Filter alphas - Target: %.2f, Current: %.2f, Error: %.2f, Derivative: %.2f, Velocity: %.2f",
+                   target_filter_alpha_, current_filter_alpha_, error_filter_alpha_, derivative_filter_alpha_, filter_alpha_);
         RCLCPP_INFO(this->get_logger(), "Position: Kp=%.2f, Kd=%.2f | Orientation: Kp=%.2f, Kd=%.2f", 
                    position_kp_, position_kd_, orientation_kp_, orientation_kd_);
     }
@@ -272,6 +279,10 @@ public:
                 // derivatives (raw)
                 << "der_pos_raw_x,der_pos_raw_y,der_pos_raw_z,"
                 << "der_ori_raw_x,der_ori_raw_y,der_ori_raw_z,"
+                
+                // derivatives (filtered) - 新增
+                << "der_pos_filt_x,der_pos_filt_y,der_pos_filt_z,"
+                << "der_ori_filt_x,der_ori_filt_y,der_ori_filt_z,"
 
                 // PD terms
                 << "lin_p_x,lin_p_y,lin_p_z,"
@@ -307,9 +318,13 @@ public:
                     << s.pos_err.x() << "," << s.pos_err.y() << "," << s.pos_err.z() << ","
                     << s.ori_err.x() << "," << s.ori_err.y() << "," << s.ori_err.z() << ","
 
-                    // derivatives
+                    // derivatives (raw)
                     << s.pos_err_der_raw.x()  << "," << s.pos_err_der_raw.y()  << "," << s.pos_err_der_raw.z()  << ","
                     << s.ori_err_der_raw.x()  << "," << s.ori_err_der_raw.y()  << "," << s.ori_err_der_raw.z()  << ","
+                    
+                    // derivatives (filtered) - 新增
+                    << s.pos_err_der_filt.x()  << "," << s.pos_err_der_filt.y()  << "," << s.pos_err_der_filt.z()  << ","
+                    << s.ori_err_der_filt.x()  << "," << s.ori_err_der_filt.y()  << "," << s.ori_err_der_filt.z()  << ","
 
                     // PD terms
                     << s.lin_p.x() << "," << s.lin_p.y() << "," << s.lin_p.z() << ","
@@ -404,6 +419,7 @@ private:
     double target_filter_alpha_;          // 目标位姿滤波
     double current_filter_alpha_;         // 当前位姿滤波  
     double error_filter_alpha_;           // 误差滤波
+    double derivative_filter_alpha_;      // 微分项滤波 (新增)
     
     // 死区（只保留速度死区）
     double velocity_deadzone_;
@@ -445,6 +461,10 @@ private:
     Eigen::Vector3d last_filtered_position_error_;
     Eigen::Vector3d last_filtered_orientation_error_;
     
+    // 滤波后的微分项 (新增)
+    Eigen::Vector3d filtered_position_derivative_;
+    Eigen::Vector3d filtered_orientation_derivative_;
+    
     // Gripper state
     double gripper_command_ = 0.0;
     double last_gripper_command_ = -1.0;
@@ -472,6 +492,8 @@ private:
         Eigen::Vector3d ori_err;
         Eigen::Vector3d pos_err_der_raw;
         Eigen::Vector3d ori_err_der_raw;
+        Eigen::Vector3d pos_err_der_filt;  // 新增
+        Eigen::Vector3d ori_err_der_filt;  // 新增
         Eigen::Vector3d lin_p;
         Eigen::Vector3d lin_d;
         Eigen::Vector3d ang_p;
@@ -828,6 +850,10 @@ private:
             filtered_orientation_error_ = raw_orientation_error;
             last_filtered_position_error_ = raw_position_error;
             last_filtered_orientation_error_ = raw_orientation_error;
+            
+            // 初始化滤波后的微分项 (新增)
+            filtered_position_derivative_.setZero();
+            filtered_orientation_derivative_.setZero();
         } else {
             filtered_position_error_ = error_filter_alpha_ * raw_position_error + 
                                       (1.0 - error_filter_alpha_) * filtered_position_error_;
@@ -861,6 +887,12 @@ private:
                 position_derivative_raw = filtered_position_error_ - last_filtered_position_error_;
                 orientation_derivative_raw = filtered_orientation_error_ - last_filtered_orientation_error_;
             }
+            
+            // ========== 对微分项进行滤波 (新增) ==========
+            filtered_position_derivative_ = derivative_filter_alpha_ * position_derivative_raw + 
+                                           (1.0 - derivative_filter_alpha_) * filtered_position_derivative_;
+            filtered_orientation_derivative_ = derivative_filter_alpha_ * orientation_derivative_raw + 
+                                              (1.0 - derivative_filter_alpha_) * filtered_orientation_derivative_;
         }
         
         // 保存当前滤波后的误差供下次使用
@@ -868,11 +900,11 @@ private:
         last_filtered_orientation_error_ = filtered_orientation_error_;
         
         // ========== PD控制律 ==========
-        // 比例项和微分项都使用滤波后的误差
+        // 比例项使用滤波后的误差，微分项使用滤波后的微分项 (修改)
         Eigen::Vector3d lin_p = position_kp_ * filtered_position_error_;
-        Eigen::Vector3d lin_d = position_kd_ * position_derivative_raw;  // 不除以dt
+        Eigen::Vector3d lin_d = position_kd_ * filtered_position_derivative_;  // 使用滤波后的微分项
         Eigen::Vector3d ang_p = orientation_kp_ * filtered_orientation_error_;
-        Eigen::Vector3d ang_d = orientation_kd_ * orientation_derivative_raw;  // 不除以dt
+        Eigen::Vector3d ang_d = orientation_kd_ * filtered_orientation_derivative_;  // 使用滤波后的微分项
 
         Eigen::Vector3d desired_linear_vel = lin_p + lin_d;
         Eigen::Vector3d desired_angular_vel = ang_p + ang_d;
@@ -948,8 +980,12 @@ private:
             s.pos_err = filtered_position_error_;     // 使用滤波后的误差记录
             s.ori_err = filtered_orientation_error_;
 
-            s.pos_err_der_raw  = position_derivative_raw;
-            s.ori_err_der_raw  = orientation_derivative_raw;
+            s.pos_err_der_raw  = filtered_position_derivative_;
+            s.ori_err_der_raw  = filtered_orientation_derivative_;
+            
+            // 记录滤波后的微分项 (新增)
+            s.pos_err_der_filt = filtered_position_derivative_;
+            s.ori_err_der_filt = filtered_orientation_derivative_;
 
             s.lin_p = lin_p;
             s.lin_d = lin_d;
@@ -988,9 +1024,11 @@ private:
                        filtered_orientation_error_.x(), filtered_orientation_error_.y(), filtered_orientation_error_.z());
             
             RCLCPP_INFO(this->get_logger(), 
-                       "Derivatives | Pos: [%.3f, %.3f, %.3f] | Orient: [%.3f, %.3f, %.3f] (no dt division)",
+                       "Derivatives (raw/filt) | Pos: [%.3f, %.3f, %.3f]/[%.3f, %.3f, %.3f] | Orient: [%.3f, %.3f, %.3f]/[%.3f, %.3f, %.3f]",
                        position_derivative_raw.x(), position_derivative_raw.y(), position_derivative_raw.z(),
-                       orientation_derivative_raw.x(), orientation_derivative_raw.y(), orientation_derivative_raw.z());
+                       filtered_position_derivative_.x(), filtered_position_derivative_.y(), filtered_position_derivative_.z(),
+                       orientation_derivative_raw.x(), orientation_derivative_raw.y(), orientation_derivative_raw.z(),
+                       filtered_orientation_derivative_.x(), filtered_orientation_derivative_.y(), filtered_orientation_derivative_.z());
             
             RCLCPP_INFO(this->get_logger(),
                        "Output vel | Linear: [%.3f, %.3f, %.3f]m/s | Angular: [%.3f, %.3f, %.3f]%s",
