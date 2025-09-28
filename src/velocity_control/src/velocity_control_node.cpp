@@ -40,10 +40,10 @@ public:
         this->declare_parameter("end_effector_link", "bracelet_link");
         
         // PD控制参数
-        this->declare_parameter("position_kp", 3.0);      // 位置比例增益
-        this->declare_parameter("position_kd", 2.0);      // 位置微分增益
-        this->declare_parameter("orientation_kp", 3.0);   // 姿态比例增益
-        this->declare_parameter("orientation_kd", 2.0);   // 姿态微分增益
+        this->declare_parameter("position_kp", 1.0);      // 位置比例增益
+        this->declare_parameter("position_kd", 8.0);      // 位置微分增益
+        this->declare_parameter("orientation_kp",1.0);   // 姿态比例增益
+        this->declare_parameter("orientation_kd", 0.7);   // 姿态微分增益
         
         // 速度和加速度限制
         this->declare_parameter("max_linear_velocity", 0.5);      
